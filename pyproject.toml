@@ -1,0 +1,87 @@
+[project]
+name = "biopb-napari-widget"
+dynamic = ["version"]
+description = "napari widgets for biopb: the Tensor Browser, image-processing clients and OME-Zarr writers"
+readme = "README.md"
+license = {file = "LICENSE"}
+authors = [{name = "Ji Yu", email = "jyu@uchc.edu"}]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Framework :: napari",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Image Processing",
+]
+# Mirrors biopb's own bound.
+requires-python = ">=3.10,<3.13"
+# napari itself is the host and is not declared, as usual for a plugin.
+dependencies = [
+    # biopb.control and biopb.tensor.Connection.
+    "biopb[tensor] >= 0.11.0rc2",
+    "numpy",
+    "pandas",
+    "dask",
+    "magicgui",
+    "qtpy",
+    "platformdirs",
+    "ome-zarr >= 0.6.1",
+    "zarr",
+    "opencv-python-headless",
+    # grpc_health.v1, for the image-processing widgets' server check.
+    "grpcio-health-checking",
+]
+
+[project.optional-dependencies]
+tables = ["napari-skimage-regionprops"]
+3d = ["vedo"]
+
+[dependency-groups]
+testing = [
+    "napari[pyqt6]",
+    "pytest",
+    "pytest-qt",
+]
+
+[project.entry-points."napari.manifest"]
+biopb-napari-widget = "biopb_napari_widget:napari.yaml"
+
+[project.urls]
+"Bug Tracker" = "https://github.com/biopb/biopb-napari-widget/issues"
+"Source Code" = "https://github.com/biopb/biopb-napari-widget"
+"Documentation" = "https://biopb.org"
+
+[build-system]
+requires = ["setuptools>=64", "setuptools_scm>=8"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+biopb_napari_widget = ["napari.yaml"]
+
+[tool.setuptools_scm]
+version_file = "src/biopb_napari_widget/_version.py"
+
+[tool.pytest.ini_options]
+qt_api = "pyqt6"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+exclude = ["_version.py"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "UP", "I", "B", "A", "C4", "ISC", "G", "PIE", "SIM"]
+ignore = [
+    "E501",
+    # magicgui reads annotations at runtime.
+    "UP006", "UP007", "UP035", "UP045",
+    "SIM105", "SIM117", "G004", "B904",
+]

@@ -1,0 +1,101 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - uses: pre-commit/action@v3.0.1
+
+  # Against the published SDK the package floor resolves to.
+  test:
+    name: ${{ matrix.os }} py${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: ubuntu-latest, python-version: '3.10'}
+          - {os: ubuntu-latest, python-version: '3.11'}
+          - {os: ubuntu-latest, python-version: '3.12'}
+          - {os: macos-latest, python-version: '3.12'}
+          - {os: windows-latest, python-version: '3.12'}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0  # setuptools_scm
+
+      # vispy/napari need a GL context.
+      - uses: pyvista/setup-headless-display-action@v4
+        with:
+          qt: true
+
+      # On Windows the step above does not replace opengl32.dll; this does.
+      - name: Install Windows OpenGL
+        if: runner.os == 'Windows'
+        run: |
+          git clone --depth 1 https://github.com/pyvista/gl-ci-helpers.git
+          powershell gl-ci-helpers/appveyor/install_opengl.ps1
+          python -c "import ctypes; ctypes.WinDLL('opengl32')"
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          activate-environment: true
+
+      - name: Install
+        run: uv pip install -e . --group testing
+
+      - name: Test
+        run: python -m pytest -v --color=yes
+
+  # Against the SDK's head, so a protocol change in biopb shows up here before
+  # it is released. Not a gate on this repo's own changes.
+  sdk-head:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: actions/checkout@v6
+        with:
+          repository: biopb/biopb
+          ref: dev
+          path: _biopb
+          fetch-depth: 0
+      - uses: pyvista/setup-headless-display-action@v4
+        with:
+          qt: true
+      - uses: bufbuild/buf-action@v1
+        with:
+          setup_only: true
+          github_token: ${{ github.token }}
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: '3.12'
+          activate-environment: true
+      - name: Install
+        run: |
+          (cd _biopb && buf generate)
+          uv pip install -e . --group testing
+          uv pip install -e "./_biopb[tensor]"
+      - name: Test
+        run: python -m pytest -v --color=yes tests
