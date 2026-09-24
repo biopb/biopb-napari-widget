@@ -1,7 +1,7 @@
 [project]
 name = "biopb-napari-widget"
 dynamic = ["version"]
-description = "napari widgets for biopb: the Tensor Browser, image-processing clients and OME-Zarr writers"
+description = "napari widgets for biopb: the Tensor Browser and OME-Zarr writers"
 readme = "README.md"
 license = {file = "LICENSE"}
 authors = [{name = "Ji Yu", email = "jyu@uchc.edu"}]
