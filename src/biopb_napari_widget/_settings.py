@@ -1,8 +1,9 @@
 """The widgets' settings: defaults, overridden by a JSON file the widgets write.
 
-The file is ``settings.json`` in the platform's user config directory for this
-package. Only the keys a user changed need to be in it; anything missing, or of
-the wrong type, reads as its default.
+The file is ``napari-widget.json`` in biopb's config directory,
+``$BIOPB_CONFIG_HOME/biopb`` (default ``~/.config/biopb`` on every platform),
+beside biopb's own config files. Only the keys a user changed need to be in it;
+anything missing, or of the wrong type, reads as its default.
 """
 
 from __future__ import annotations
@@ -15,8 +16,6 @@ import tempfile
 import threading
 from pathlib import Path
 from typing import Any
-
-import platformdirs
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +59,14 @@ DEFAULTS: dict[str, dict[str, Any]] = {
 
 
 def settings_path() -> Path:
-    return Path(platformdirs.user_config_dir("biopb-napari-widget")) / "settings.json"
+    # biopb's rule: an absolute $BIOPB_CONFIG_HOME, else ~/.config; XDG_* is
+    # not read. biopb refuses a relative value; a widget falls back instead.
+    raw = os.environ.get("BIOPB_CONFIG_HOME")
+    if raw and not os.path.isabs(raw):
+        logger.warning("Ignoring relative BIOPB_CONFIG_HOME=%r", raw)
+        raw = None
+    base = Path(raw) if raw else Path.home() / ".config"
+    return base / "biopb" / "napari-widget.json"
 
 
 def _type_ok(value, default) -> bool:

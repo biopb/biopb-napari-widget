@@ -28,7 +28,6 @@ dependencies = [
     "dask",
     "magicgui",
     "qtpy",
-    "platformdirs",
     "ome-zarr >= 0.6.1",
     "zarr",
     "opencv-python-headless",
