@@ -53,3 +53,35 @@ def test_grid_params():
     size, stride = get_grid_params(True)
     assert size.tolist() == [64, 512, 512]
     assert stride.dtype.kind == "i"
+
+
+class TestWhereItLives:
+    """biopb's config directory, by biopb's rules."""
+
+    def _path(self, monkeypatch, tmp_path, **env):
+        import pathlib
+
+        monkeypatch.undo()  # drop the autouse redirect
+        monkeypatch.setattr(pathlib.Path, "home", classmethod(lambda cls: tmp_path))
+        monkeypatch.delenv("BIOPB_CONFIG_HOME", raising=False)
+        for name, value in env.items():
+            monkeypatch.setenv(name, value)
+        return _settings.settings_path()
+
+    def test_defaults_to_the_biopb_tree_under_dot_config(self, monkeypatch, tmp_path):
+        path = self._path(monkeypatch, tmp_path)
+        assert path == tmp_path / ".config" / "biopb" / "napari-widget.json"
+
+    def test_follows_biopb_config_home(self, monkeypatch, tmp_path):
+        path = self._path(
+            monkeypatch, tmp_path, BIOPB_CONFIG_HOME=str(tmp_path / "cfg")
+        )
+        assert path == tmp_path / "cfg" / "biopb" / "napari-widget.json"
+
+    def test_a_relative_biopb_config_home_is_ignored(self, monkeypatch, tmp_path):
+        path = self._path(monkeypatch, tmp_path, BIOPB_CONFIG_HOME="rel/cfg")
+        assert path == tmp_path / ".config" / "biopb" / "napari-widget.json"
+
+    def test_xdg_config_home_is_not_read(self, monkeypatch, tmp_path):
+        path = self._path(monkeypatch, tmp_path, XDG_CONFIG_HOME=str(tmp_path / "xdg"))
+        assert path == tmp_path / ".config" / "biopb" / "napari-widget.json"
