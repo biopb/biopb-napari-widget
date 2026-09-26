@@ -1,18 +1,15 @@
 """Tests for _grpc.py gRPC communication."""
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
 
 from biopb_napari_widget.image_processing._grpc import (
     _check_chunk_memory,
-    _encode_image,
     _estimate_chunk_memory_mb,
-    _get_detection_settings,
     _get_grpc_channel,
     _get_label_filter,
-    _object_detection_build_request,
     _parse_annotation_tsv,
     _parse_server_url,
 )
@@ -161,95 +158,6 @@ class TestGetLabelFilter:
             _get_label_filter("invalid:url:format")
 
 
-class TestEncodeImage:
-    """Tests for _encode_image function."""
-
-    def test_2d_image_encoding(self):
-        """2D image (3D array with YXC) is encoded correctly."""
-        image = np.random.rand(100, 100, 1)  # 2D with channel
-        pixels = _encode_image(image, np_index_order="YXC", z_ratio=1.0)
-
-        # Should add batch dimension
-        # Result is a protobuf Pixels object
-        assert pixels is not None
-
-    def test_3d_image_encoding(self):
-        """3D image (4D array with ZYXC) is encoded correctly."""
-        image = np.random.rand(10, 100, 100, 1)  # 3D with channel
-        pixels = _encode_image(image, np_index_order="ZYXC", z_ratio=2.0)
-
-        assert pixels is not None
-
-    def test_grayscale_encoding(self):
-        """Grayscale image (2D array with YX) is encoded correctly."""
-        image = np.random.rand(100, 100)  # 2D grayscale
-        pixels = _encode_image(image, np_index_order="YX", z_ratio=1.0)
-
-        assert pixels is not None
-
-    def test_invalid_dimensions_raises(self):
-        """Invalid image dimensions raise ValueError."""
-        # 2D without matching np_index_order
-        image = np.random.rand(100, 100)  # 2D array
-
-        with pytest.raises(ValueError, match="must have 3 dimensions"):
-            _encode_image(image, np_index_order="YXC")  # expects 3 dims
-
-    def test_5d_image_raises(self):
-        """5D image with wrong np_index_order raises ValueError."""
-        image = np.random.rand(2, 10, 100, 100, 1)
-
-        with pytest.raises(ValueError, match="must have 4 dimensions"):
-            _encode_image(image, np_index_order="ZYXC")  # expects 4 dims
-
-
-class TestGetDetectionSettings:
-    """Tests for _get_detection_settings function."""
-
-    def test_basic_settings(self):
-        """Basic settings are converted correctly."""
-        settings = {
-            "Min Score": 0.5,
-            "NMS": "Off",
-            "Size Hint": 30.0,
-        }
-        result = _get_detection_settings(settings)
-
-        assert result.min_score == 0.5
-        assert result.nms_iou == 0.0
-        assert result.cell_diameter_hint == 30.0
-
-    def test_nms_iou_values(self):
-        """NMS IOU values are mapped correctly."""
-        nms_map = {
-            "Off": 0.0,
-            "Iou-0.2": 0.2,
-            "Iou-0.4": 0.4,
-            "Iou-0.6": 0.6,
-            "Iou-0.8": 0.8,
-        }
-
-        for nms_key, expected_iou in nms_map.items():
-            settings = {
-                "Min Score": 0.4,
-                "NMS": nms_key,
-                "Size Hint": 32.0,
-            }
-            result = _get_detection_settings(settings)
-            assert result.nms_iou == pytest.approx(expected_iou)
-
-    def test_invalid_nms_raises(self):
-        """Invalid NMS value raises KeyError."""
-        settings = {
-            "Min Score": 0.5,
-            "NMS": "Invalid",
-            "Size Hint": 30.0,
-        }
-
-        with pytest.raises(KeyError):
-            _get_detection_settings(settings)
-
-
 class TestGetGrpcChannel:
     """Tests for _get_grpc_channel function."""
 
@@ -319,72 +227,6 @@ class TestGetGrpcChannel:
         }
         with pytest.raises(ValueError, match="Invalid server URL"):
             _get_grpc_channel(settings)
-
-
-class TestObjectDetectionBuildRequest:
-    """Tests for _object_detection_build_request function."""
-
-    def test_request_structure(self):
-        """Request contains expected structure."""
-        image = np.random.rand(100, 100, 1)
-        settings = {
-            "Z Aspect Ratio": 1.0,
-            "Min Score": 0.5,
-            "NMS": "Off",
-            "Size Hint": 30.0,
-        }
-        request = _object_detection_build_request(image, settings)
-
-        assert request.image_data is not None
-        assert request.detection_settings is not None
-
-    def test_z_ratio_passed(self):
-        """Z aspect ratio is passed to encoding."""
-        image = np.random.rand(10, 100, 100, 1)
-        settings = {
-            "Z Aspect Ratio": 5.0,
-            "Min Score": 0.5,
-            "NMS": "Iou-0.4",
-            "Size Hint": 30.0,
-        }
-        request = _object_detection_build_request(image, settings)
-        assert request is not None
-
-
-class TestGrpcObjectDetection:
-    """Tests for grpc_object_detection generator function."""
-
-    def test_invalid_dimensions_2d_mode(self):
-        """Wrong dimensions for 2D mode raises ValueError."""
-        # The function is wrapped in thread_worker, so we test the validation
-        # by calling the underlying logic.
-        # We can't easily test this due to the thread_worker decorator, which
-        # requires complex mocking; this documents the expected behavior.
-
-    def test_invalid_dimensions_3d_mode(self):
-        """Wrong dimensions for 3D mode raises ValueError."""
-        # Similar to above - documenting expected behavior
-
-    @patch("biopb_napari_widget.image_processing._grpc._get_grpc_channel")
-    @patch("biopb_napari_widget.image_processing._grpc.proto.ObjectDetectionStub")
-    def test_generator_yields_progress(self, mock_stub_class, mock_channel_func):
-        """Generator yields None for progress updates."""
-        # Setup mocks
-        mock_channel = MagicMock()
-        mock_channel_func.return_value.__enter__ = MagicMock(return_value=mock_channel)
-        mock_channel_func.return_value.__exit__ = MagicMock(return_value=False)
-
-        mock_stub = MagicMock()
-        mock_stub_class.return_value = mock_stub
-
-        # Mock detection response
-        mock_response = MagicMock()
-        mock_response.detections = []
-        mock_stub.RunDetection.return_value = mock_response
-
-        # Getting the generator means unwrapping thread_worker (it returns a
-        # worker object, not the inner generator); that mocking is complex, so
-        # this documents the expected behavior rather than exercising it.
 
 
 class TestGrpcProcessImage:

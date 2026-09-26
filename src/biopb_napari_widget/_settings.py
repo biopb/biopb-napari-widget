@@ -21,29 +21,14 @@ logger = logging.getLogger(__name__)
 
 DEFAULTS: dict[str, dict[str, Any]] = {
     "widget": {
-        # The ProcessImage / ObjectDetection server the widgets target.
+        # The ProcessImage server the widgets target.
         "server_url": "localhost:50051",
         "is_3d": False,
-    },
-    "detection": {
-        "min_score": 0.4,
-        "size_hint": 32.0,
-        "nms": "Off",
-        "z_aspect_ratio": 1.0,
-    },
-    # Tiling for large-image detection, per axis; stride < size overlaps tiles.
-    "grid": {
-        "size_2d": [4096, 4096],
-        "stride_2d": [4000, 4000],
-        "size_3d": [64, 512, 512],
-        "stride_3d": [48, 480, 480],
     },
     # Per-call gRPC timeouts, seconds.
     "timeout": {
         "health_check": 5.0,
         "get_op_names": 10.0,
-        "detection_2d": 15,
-        "detection_3d": 300,
         "process_image": 300,
     },
     "grpc": {
@@ -137,14 +122,3 @@ class Settings:
 
 
 SETTINGS = Settings()
-
-
-def get_grid_params(is_3d: bool):
-    """``(grid_size, stride)`` as int arrays for 2-D or 3-D detection."""
-    import numpy as np
-
-    suffix = "3d" if is_3d else "2d"
-    return (
-        np.array(SETTINGS.get(f"grid.size_{suffix}"), dtype=int),
-        np.array(SETTINGS.get(f"grid.stride_{suffix}"), dtype=int),
-    )
