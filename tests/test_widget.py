@@ -12,8 +12,10 @@ from biopb_napari_widget.image_processing import ImageProcessingWidget
     sys.platform == "darwin" and os.getenv("CI") == "true",
     reason="OpenGL context unavailable on macOS CI headless environment",
 )
-def test_widget_instantiation(make_napari_viewer, request):
+def test_widget_instantiation(make_napari_viewer, request, monkeypatch):
     """Test widget instantiation."""
+    # Construction would start a worker fetching ops from a server.
+    monkeypatch.setattr(ImageProcessingWidget, "_fetch_ops", lambda self: None)
     viewer = make_napari_viewer(show=False)
     request.addfinalizer(viewer.close)
     my_widget = ImageProcessingWidget(viewer)
