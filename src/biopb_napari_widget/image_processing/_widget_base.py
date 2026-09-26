@@ -155,7 +155,7 @@ class _WidgetBase(Container):
                     except Exception:
                         pass  # Future may already be done
             else:
-                # Single future (for object detection which is still sequential)
+                # Single future
                 try:
                     active_futures.cancel()
                 except Exception:

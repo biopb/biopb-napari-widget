@@ -1,9 +1,10 @@
+from __future__ import annotations
+
 import io
 import logging
 import math
 import re
 import threading
-import time
 from collections.abc import Generator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Tuple
@@ -23,7 +24,6 @@ from napari.qt.threading import thread_worker
 from .._settings import SETTINGS
 from .._typing import napari_data
 from ._chunking import FULL_ORDER, IterationSpec, _data_iterator
-from ._render import _adjust_response_offset, _generate_label
 
 logger = logging.getLogger(__name__)
 
@@ -88,7 +88,7 @@ def _check_chunk_memory(chunk) -> None:
     if estimated_mb > error_mb:
         raise MemoryError(
             f"Chunk size ({estimated_mb:.1f}MB) exceeds memory limit ({error_mb}MB). "
-            "Reduce grid size or increase stride in config to process smaller chunks."
+            "Iterate over more dimensions to process smaller chunks."
         )
 
     if estimated_mb > warn_mb:
@@ -216,72 +216,6 @@ def _parse_annotation_tsv(annotation: str) -> pd.DataFrame:
     return df
 
 
-def _encode_image(
-    image: np.ndarray, np_index_order: str = "YXC", z_ratio: float = 1.0
-) -> proto.ImageData:
-    """Encode numpy image array to protobuf ImageData format.
-
-    Args:
-        image: Input image array (must match np_index_order specification)
-        np_index_order: Axis order string (e.g., "YXC", "ZYXC", "YX", "ZYX")
-        z_ratio: Z aspect ratio for 3D images
-
-    Returns:
-        protobuf ImageData object
-
-    Raises:
-        ValueError: If image dimensions don't match np_index_order
-    """
-    expected_ndim = len(np_index_order)
-    if image.ndim != expected_ndim:
-        raise ValueError(
-            f"Image must have {expected_ndim} dimensions for np_index_order '{np_index_order}'. "
-            f"Got shape {image.shape} with {image.ndim} dimensions"
-        )
-
-    # Add batch dimension (B, ...) for processing
-    image = image[None, ...]
-
-    # Convert axis order string to list of individual labels
-    dim_labels = list(np_index_order)
-
-    image_data = serialize_from_numpy_to_image_data(
-        image,
-        dim_labels=["B"] + dim_labels,
-    )
-
-    return image_data
-
-
-def _object_detection_build_request(
-    image: np.ndarray, settings: dict
-) -> proto.DetectionRequest:
-    """Serialize a np image array as ImageData protobuf."""
-    # Determine np_index_order from image shape
-    # Object detection expects YXC (2D) or ZYXC (3D)
-    if image.ndim == 3:
-        np_index_order = "YXC"
-    elif image.ndim == 4:
-        np_index_order = "ZYXC"
-    else:
-        raise ValueError(
-            f"Object detection image must have 3 or 4 dimensions. Got {image.ndim}"
-        )
-
-    image_data = _encode_image(
-        image,
-        np_index_order=np_index_order,
-        z_ratio=settings["Z Aspect Ratio"],
-    )
-
-    request = proto.DetectionRequest(
-        image_data=image_data,
-        detection_settings=_get_detection_settings(settings),
-    )
-
-    return request
-
-
 def _get_grpc_channel(settings: dict):
     """Create gRPC channel based on server URL.
 
@@ -381,132 +315,6 @@ def get_op_names(settings: dict, timeout: float | None = None) -> proto.OpNames:
         logger.debug("Received %d ops from server", len(response.names))
 
         return response
-
-
-def _get_detection_settings(settings: dict):
-    """Convert widget settings to DetectionSettings protobuf."""
-    nms_values = {
-        "Off": 0.0,
-        "Iou-0.2": 0.2,
-        "Iou-0.4": 0.4,
-        "Iou-0.6": 0.6,
-        "Iou-0.8": 0.8,
-    }
-    nms_iou = nms_values[settings["NMS"]]
-
-    return proto.DetectionSettings(
-        min_score=settings["Min Score"],
-        nms_iou=nms_iou,
-        cell_diameter_hint=settings["Size Hint"],
-    )
-
-
-@thread_worker
-def grpc_object_detection(
-    image_data: napari_data,
-    settings: dict,
-    grid_positions: list,
-    abort_event: threading.Event | None = None,
-    future_container: dict | None = None,
-) -> Generator[np.ndarray, None, None]:
-    """Run object detection on image data via gRPC.
-
-    Args:
-        image_data: Input image(s) as dask array or numpy array
-        settings: Widget settings dict
-        grid_positions: List of slice tuples for patch positions
-        abort_event: Optional threading.Event to signal cancellation
-        future_container: Optional dict to store active gRPC future for direct cancellation
-
-    Yields:
-        None for progress updates, then label array for each image
-
-    Raises:
-        ValueError: If image dimensions don't match expected format
-    """
-    is3d = settings["3D"]
-    expected_ndim = 5 if is3d else 4
-    if image_data.ndim != expected_ndim:
-        raise ValueError(
-            f"For {'3D' if is3d else '2D'} mode, image data must have {expected_ndim} dimensions "
-            f"(batch, {'z,' if is3d else ''}y, x, channel). Got shape {image_data.shape} with {image_data.ndim} dimensions"
-        )
-
-    # Get timeout from config
-    timeout = SETTINGS.get(f"timeout.{'detection_3d' if is3d else 'detection_2d'}")
-
-    server = settings["Server"]
-    logger.info("Starting object detection on %s", server)
-
-    # call server
-    with _get_grpc_channel(settings) as channel:
-        stub = proto.ObjectDetectionStub(channel)
-
-        for image in image_data:
-            # start with an empty response
-            response = proto.DetectionResponse()
-
-            for grid in grid_positions:
-                # Check for abort before processing each patch
-                if abort_event is not None and abort_event.is_set():
-                    logger.info("Object detection aborted by user")
-                    return
-
-                logger.debug("Processing patch %s", grid)
-
-                patch_slice = image.__getitem__(grid)
-
-                # Check memory before numpy conversion
-                _check_chunk_memory(patch_slice)
-
-                patch = np.array(patch_slice)
-
-                request = _object_detection_build_request(patch, settings)
-
-                # Signal call start for progress bar
-                yield CALL_START
-
-                future = stub.RunDetection.future(request)
-
-                # Store future in container for direct cancellation from UI thread
-                if future_container is not None:
-                    future_container["active"] = future
-
-                # Poll for abort while waiting for response
-                while not future.done():
-                    if abort_event is not None and abort_event.is_set():
-                        future.cancel()
-                        if future_container is not None:
-                            future_container["active"] = None
-                        logger.info("gRPC RunDetection call cancelled")
-                        return
-                    time.sleep(0.05)
-
-                # Clear future reference after call completes
-                if future_container is not None:
-                    future_container["active"] = None
-
-                try:
-                    patch_response = future.result(timeout=timeout)
-                except grpc.FutureCancelledError:
-                    logger.info("gRPC RunDetection call was cancelled")
-                    return
-                patch_response = _adjust_response_offset(patch_response, grid)
-
-                logger.debug(
-                    "Detected %d cells in patch",
-                    len(patch_response.detections),
-                )
-
-                response.MergeFrom(patch_response)
-
-                yield
-
-            logger.info("Detected %d cells in image", len(response.detections))
-
-            yield _generate_label(
-                response, np.zeros(image_data.shape[1:-1], dtype="uint16")
-            )
 
 
 def _process_single_chunk(
@@ -609,8 +417,7 @@ def grpc_process_image(
         ValueError: If operation changes iterated dimensions from singleton
     """
     # Get timeout and concurrency from config
-    is3d = "Z" in iter_spec.axis_order
-    timeout = SETTINGS.get(f"timeout.{'detection_3d' if is3d else 'detection_2d'}")
+    timeout = SETTINGS.get("timeout.process_image")
     max_concurrent = SETTINGS.get("grpc.max_concurrent_calls")
 
     server = settings["Server"]

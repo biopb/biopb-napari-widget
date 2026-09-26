@@ -3,7 +3,7 @@
 import json
 
 from biopb_napari_widget import _settings
-from biopb_napari_widget._settings import SETTINGS, get_grid_params
+from biopb_napari_widget._settings import SETTINGS
 
 
 def _write(obj):
@@ -13,19 +13,19 @@ def _write(obj):
 
 def test_no_file_reads_the_defaults():
     assert SETTINGS.get("widget.server_url") == "localhost:50051"
-    assert SETTINGS.get("grid.size_3d") == [64, 512, 512]
+    assert SETTINGS.get("timeout.process_image") == 300
 
 
 def test_a_stored_key_overrides_and_the_rest_default():
-    _write({"detection": {"min_score": 0.7}})
-    assert SETTINGS.get("detection.min_score") == 0.7
-    assert SETTINGS.get("detection.nms") == "Off"
+    _write({"memory": {"warn_threshold_mb": 100}})
+    assert SETTINGS.get("memory.warn_threshold_mb") == 100
+    assert SETTINGS.get("memory.error_threshold_mb") == 2000
 
 
 def test_a_value_of_the_wrong_type_reads_as_its_default():
-    _write({"widget": {"is_3d": "yes"}, "grid": {"size_2d": [1, 2, 3]}})
+    _write({"widget": {"is_3d": "yes"}, "memory": {"warn_threshold_mb": "big"}})
     assert SETTINGS.get("widget.is_3d") is False
-    assert SETTINGS.get("grid.size_2d") == [4096, 4096]
+    assert SETTINGS.get("memory.warn_threshold_mb") == 500
 
 
 def test_an_unreadable_file_reads_as_the_defaults():
@@ -47,12 +47,6 @@ def test_a_batched_set_is_not_written_until_save():
     assert not _settings.settings_path().exists()
     SETTINGS.save()
     assert _settings.settings_path().exists()
-
-
-def test_grid_params():
-    size, stride = get_grid_params(True)
-    assert size.tolist() == [64, 512, 512]
-    assert stride.dtype.kind == "i"
 
 
 class TestWhereItLives:
