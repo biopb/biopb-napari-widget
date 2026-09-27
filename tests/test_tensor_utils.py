@@ -685,6 +685,82 @@ class TestAddTensorLayer:
         _, kwargs = viewer.add_image.call_args
         assert "rgb" not in kwargs
 
+    def test_tolerates_a_bare_mock_viewer_with_dim_labels(self):
+        # _apply_axis_labels reads viewer.dims.axis_labels/layer.ndim to place
+        # labels; a bare MagicMock reports len(axis_labels) == 0, shorter than
+        # any real layer, so this exercises the out-of-bounds-axis skip.
+        viewer = MagicMock()
+        client = _make_physical_client(None)
+        client.get_tensor.return_value = da.zeros((3, 64, 32))
+        desc = _make_tensor_desc([3, 64, 32], ["c", "y", "x"])
+
+        add_tensor_layer(viewer, client, "src", "t1", desc, name="lyr")
+
+        viewer.dims.set_axis_label.assert_not_called()
+
+
+class TestAddTensorLayerNamesTheDimsSliders:
+    """The dims sliders get the source's own axis names, in place of napari's
+    positional defaults (``-1``, ``-2``, ...) -- biopb-napari-widget#5.
+
+    ``ViewerModel``, not a mock: the point is ``viewer.dims.axis_labels``
+    after napari's own dims machinery has reacted to the add.
+    """
+
+    @staticmethod
+    def _viewer():
+        from napari.components import ViewerModel
+
+        return ViewerModel()
+
+    def test_first_layer_gets_its_axes_named(self):
+        viewer = self._viewer()
+        client = _make_physical_client(None)
+        client.get_tensor.return_value = da.zeros((5, 3, 4, 64, 64))
+        desc = _make_tensor_desc([5, 3, 4, 64, 64], ["T", "C", "Z", "Y", "X"])
+
+        add_tensor_layer(viewer, client, "src", "t1", desc, name="lyr")
+
+        assert viewer.dims.axis_labels == ("T", "C", "Z", "Y", "X")
+
+    def test_a_smaller_second_layer_does_not_clobber_the_first(self):
+        # dims are viewer-global: the second layer's own Y/X agree with the
+        # first, and the leading T/C/Z it does not have must stay untouched.
+        viewer = self._viewer()
+        client = _make_physical_client(None)
+        client.get_tensor.return_value = da.zeros((5, 3, 4, 64, 64))
+        desc = _make_tensor_desc([5, 3, 4, 64, 64], ["T", "C", "Z", "Y", "X"])
+        add_tensor_layer(viewer, client, "src", "t1", desc, name="first")
+
+        client2 = _make_physical_client(None)
+        client2.get_tensor.return_value = da.zeros((64, 64))
+        desc2 = _make_tensor_desc([64, 64], ["Y", "X"])
+        add_tensor_layer(viewer, client2, "src2", "t2", desc2, name="second")
+
+        assert viewer.dims.axis_labels == ("T", "C", "Z", "Y", "X")
+
+    def test_rgb_drops_the_trailing_samples_label(self):
+        # layer.ndim folds the trailing colour axis away; S must not land on
+        # the axis Y actually occupies.
+        viewer = self._viewer()
+        client = _make_physical_client(None)
+        client.get_tensor.return_value = da.zeros((4, 64, 64, 3), dtype="uint8")
+        desc = _make_tensor_desc([4, 64, 64, 3], ["Z", "Y", "X", "S"])
+
+        add_tensor_layer(viewer, client, "src", "t1", desc, name="lyr")
+
+        assert viewer.dims.axis_labels == ("Z", "Y", "X")
+
+    def test_no_dim_labels_leaves_the_defaults(self):
+        viewer = self._viewer()
+        client = _make_physical_client(None)
+        client.get_tensor.return_value = da.zeros((64, 64))
+        desc = _make_tensor_desc([64, 64])
+
+        add_tensor_layer(viewer, client, "src", "t1", desc, name="lyr")
+
+        assert viewer.dims.axis_labels == ("-2", "-1")
+
 
 class TestOriginInitialView:
     """The context manager that pins the first layer's view to the origin so a
@@ -1015,6 +1091,13 @@ class TestALabelSetOnARealViewerModel:
         layer = self._add(viewer)
         assert isinstance(layer, Labels)
         assert layer.ndim == 5
+
+    def test_dims_are_named_from_the_aligned_image_axes(self):
+        # scale_desc is the image once aligned, so the set's own (T, Z, Y, X)
+        # is not what should land on the sliders -- the image's (with C) is.
+        viewer = self._viewer()
+        self._add(viewer)
+        assert viewer.dims.axis_labels == ("T", "C", "Z", "Y", "X")
 
     def test_the_scale_is_the_length_napari_requires(self):
         # A scale shorter or longer than layer.ndim raises out of napari.
