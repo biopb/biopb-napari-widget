@@ -686,6 +686,69 @@ class TestAddTensorLayer:
         assert "rgb" not in kwargs
 
 
+class TestAddTensorLayerNamesTheDimsSliders:
+    """The dims sliders get the source's own axis names, in place of napari's
+    positional defaults (``-1``, ``-2``, ...) -- biopb-napari-widget#5.
+
+    ``ViewerModel``, not a mock: the point is ``viewer.dims.axis_labels``
+    after napari's own dims machinery has reacted to the add.
+    """
+
+    @staticmethod
+    def _viewer():
+        from napari.components import ViewerModel
+
+        return ViewerModel()
+
+    def test_first_layer_gets_its_axes_named(self):
+        viewer = self._viewer()
+        client = _make_physical_client(None)
+        client.get_tensor.return_value = da.zeros((5, 3, 4, 64, 64))
+        desc = _make_tensor_desc([5, 3, 4, 64, 64], ["T", "C", "Z", "Y", "X"])
+
+        add_tensor_layer(viewer, client, "src", "t1", desc, name="lyr")
+
+        assert viewer.dims.axis_labels == ("T", "C", "Z", "Y", "X")
+
+    def test_a_smaller_second_layer_does_not_clobber_the_first(self):
+        # dims are viewer-global: the second layer's own Y/X agree with the
+        # first, and the leading T/C/Z it does not have must stay untouched.
+        viewer = self._viewer()
+        client = _make_physical_client(None)
+        client.get_tensor.return_value = da.zeros((5, 3, 4, 64, 64))
+        desc = _make_tensor_desc([5, 3, 4, 64, 64], ["T", "C", "Z", "Y", "X"])
+        add_tensor_layer(viewer, client, "src", "t1", desc, name="first")
+
+        client2 = _make_physical_client(None)
+        client2.get_tensor.return_value = da.zeros((64, 64))
+        desc2 = _make_tensor_desc([64, 64], ["Y", "X"])
+        add_tensor_layer(viewer, client2, "src2", "t2", desc2, name="second")
+
+        assert viewer.dims.axis_labels == ("T", "C", "Z", "Y", "X")
+
+    def test_rgb_drops_the_trailing_samples_label(self):
+        # layer.ndim folds the trailing colour axis away; S must not land on
+        # the axis Y actually occupies.
+        viewer = self._viewer()
+        client = _make_physical_client(None)
+        client.get_tensor.return_value = da.zeros((4, 64, 64, 3), dtype="uint8")
+        desc = _make_tensor_desc([4, 64, 64, 3], ["Z", "Y", "X", "S"])
+
+        add_tensor_layer(viewer, client, "src", "t1", desc, name="lyr")
+
+        assert viewer.dims.axis_labels == ("Z", "Y", "X")
+
+    def test_no_dim_labels_leaves_the_defaults(self):
+        viewer = self._viewer()
+        client = _make_physical_client(None)
+        client.get_tensor.return_value = da.zeros((64, 64))
+        desc = _make_tensor_desc([64, 64])
+
+        add_tensor_layer(viewer, client, "src", "t1", desc, name="lyr")
+
+        assert viewer.dims.axis_labels == ("-2", "-1")
+
+
 class TestOriginInitialView:
     """The context manager that pins the first layer's view to the origin so a
     multi-channel tensor decodes one coarse plane at load, not two (thumbnail
@@ -1015,6 +1078,13 @@ class TestALabelSetOnARealViewerModel:
         layer = self._add(viewer)
         assert isinstance(layer, Labels)
         assert layer.ndim == 5
+
+    def test_dims_are_named_from_the_aligned_image_axes(self):
+        # scale_desc is the image once aligned, so the set's own (T, Z, Y, X)
+        # is not what should land on the sliders -- the image's (with C) is.
+        viewer = self._viewer()
+        self._add(viewer)
+        assert viewer.dims.axis_labels == ("T", "C", "Z", "Y", "X")
 
     def test_the_scale_is_the_length_napari_requires(self):
         # A scale shorter or longer than layer.ndim raises out of napari.

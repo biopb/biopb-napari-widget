@@ -137,6 +137,44 @@ def canonical_dim_labels(tensor_desc) -> List[str] | None:
     return [str(label).lower() for label in dim_labels]
 
 
+def _apply_axis_labels(viewer, layer, dim_labels: List[str] | None) -> None:
+    """Name *layer*'s dims sliders from :func:`canonical_dim_labels`, in place
+    of napari's own positional defaults (``-1``, ``-2``, ...).
+
+    Two trims, both right-aligned because Y and X are always the trailing
+    axes:
+
+    - *dim_labels* names every axis of the source array, one entry longer than
+      ``layer.ndim`` when napari folds a trailing interleaved-colour axis into
+      an ``rgb`` layer instead of slicing it (the same gap
+      :func:`canonical_dim_labels` notes for the OME-Zarr writer) -- trimmed
+      to ``layer.ndim`` first.
+    - napari's dims are viewer-global, not per layer, and broadcast a shorter
+      layer's axes onto the *trailing* ``layer.ndim`` of ``viewer.dims.ndim``
+      (``Dims._update_default_axis_labels``), so a label lands at that same
+      offset from the end.
+
+    An axis a previous layer already named is left alone -- only one still
+    carrying napari's own default (``str(axis - ndim)``) is filled, since a
+    later layer's guess is not more authoritative than an earlier one's.
+    """
+    if not dim_labels:
+        return
+    labels = dim_labels[: layer.ndim]
+    current = list(viewer.dims.axis_labels)
+    ndim = len(current)
+    offset = ndim - len(labels)
+    axes, values = [], []
+    for i, label in enumerate(labels):
+        axis = offset + i
+        if axis < 0 or current[axis] != str(axis - ndim):
+            continue
+        axes.append(axis)
+        values.append(label.upper())
+    if axes:
+        viewer.dims.set_axis_label(axes, values)
+
+
 def _advertised_pyramid_levels(client, source_id, tensor_id, tensor_desc):
     """The server-advertised pyramid: per-level ``scale_hint`` + ``reduction_method``.
 
@@ -528,6 +566,7 @@ def _add_label_layer(
     # raises out of napari rather than refusing, so an editable one offers an
     # edit that cannot land. (Multiscale is already read-only.)
     layer.editable = False
+    _apply_axis_labels(viewer, layer, dim_labels)
     return layer
 
 
@@ -554,7 +593,8 @@ def add_tensor_layer(
     canonicalized axis names as ``metadata['dim_labels']`` (the only way a
     writer, which sees just ``(path, data, meta)``, can name the axes) and the
     originating ``metadata['array_id']``, then ``add_image``
-    (``multiscale=True`` when there is more than one level).
+    (``multiscale=True`` when there is more than one level) and name the dims
+    sliders from those same labels (:func:`_apply_axis_labels`).
 
     **A label set becomes a ``Labels`` layer**, not an image one. The set is an
     ordinary tensor and its ``array_id`` is the only thing that says so
@@ -648,5 +688,8 @@ def add_tensor_layer(
 
     with _origin_initial_view(viewer):
         if len(levels) > 1:
-            return viewer.add_image(levels, multiscale=True, **add_kwargs)
-        return viewer.add_image(levels[0], **add_kwargs)
+            layer = viewer.add_image(levels, multiscale=True, **add_kwargs)
+        else:
+            layer = viewer.add_image(levels[0], **add_kwargs)
+    _apply_axis_labels(viewer, layer, labels)
+    return layer
