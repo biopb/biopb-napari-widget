@@ -150,24 +150,34 @@ def _apply_axis_labels(viewer, layer, dim_labels: List[str] | None) -> None:
       :func:`canonical_dim_labels` notes for the OME-Zarr writer) -- trimmed
       to ``layer.ndim`` first.
     - napari's dims are viewer-global, not per layer, and broadcast a shorter
-      layer's axes onto the *trailing* ``layer.ndim`` of ``viewer.dims.ndim``
-      (``Dims._update_default_axis_labels``), so a label lands at that same
-      offset from the end.
+      layer's axes onto the *trailing* ``layer.ndim`` of ``viewer.dims.ndim``,
+      so a label lands at that same offset from the end.
 
     An axis a previous layer already named is left alone -- only one still
-    carrying napari's own default (``str(axis - ndim)``) is filled, since a
-    later layer's guess is not more authoritative than an earlier one's.
+    carrying napari's own default is filled, since a later layer's guess is
+    not more authoritative than an earlier one's. The default is read off a
+    scratch ``Dims`` of the same rank rather than restated as a format string,
+    so a change to napari's own convention is picked up rather than silently
+    stopped matching.
+
+    Bounds-checked rather than assumed: real napari dims always cover the
+    layer just added, but a caller against a bare stand-in viewer (as much of
+    this module's own test suite uses) need not simulate that, and skipping
+    an axis outside ``viewer.dims`` is the same no-op either way.
     """
+    from napari.components.dims import Dims
+
     if not dim_labels:
         return
     labels = dim_labels[: layer.ndim]
-    current = list(viewer.dims.axis_labels)
+    current = viewer.dims.axis_labels
     ndim = len(current)
+    defaults = Dims(ndim=ndim).axis_labels
     offset = ndim - len(labels)
     axes, values = [], []
     for i, label in enumerate(labels):
         axis = offset + i
-        if axis < 0 or current[axis] != str(axis - ndim):
+        if not (0 <= axis < ndim) or current[axis] != defaults[axis]:
             continue
         axes.append(axis)
         values.append(label.upper())

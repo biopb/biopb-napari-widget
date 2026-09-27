@@ -685,6 +685,19 @@ class TestAddTensorLayer:
         _, kwargs = viewer.add_image.call_args
         assert "rgb" not in kwargs
 
+    def test_tolerates_a_bare_mock_viewer_with_dim_labels(self):
+        # _apply_axis_labels reads viewer.dims.axis_labels/layer.ndim to place
+        # labels; a bare MagicMock reports len(axis_labels) == 0, shorter than
+        # any real layer, so this exercises the out-of-bounds-axis skip.
+        viewer = MagicMock()
+        client = _make_physical_client(None)
+        client.get_tensor.return_value = da.zeros((3, 64, 32))
+        desc = _make_tensor_desc([3, 64, 32], ["c", "y", "x"])
+
+        add_tensor_layer(viewer, client, "src", "t1", desc, name="lyr")
+
+        viewer.dims.set_axis_label.assert_not_called()
+
 
 class TestAddTensorLayerNamesTheDimsSliders:
     """The dims sliders get the source's own axis names, in place of napari's
