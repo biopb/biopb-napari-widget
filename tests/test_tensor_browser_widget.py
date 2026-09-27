@@ -634,6 +634,52 @@ class TestRemoveButton:
         w._start_remove.assert_not_called()
 
 
+class TestHidesEmptySources:
+    """`_build_and_display_tree` drops a resolved source with nothing on it --
+    it would only be a row that opens an empty list."""
+
+    @staticmethod
+    def _src(source_id, *, tensors, is_resolved=True):
+        from biopb_napari_widget._catalog import CatalogSource, CatalogTensor
+
+        return CatalogSource(
+            source_id=source_id,
+            source_url=f"{source_id}.zarr",
+            is_resolved=is_resolved,
+            tensors=tuple(
+                CatalogTensor(array_id=t, shape=(8, 8), dtype="uint8") for t in tensors
+            ),
+        )
+
+    @staticmethod
+    def _render(widget, sources):
+        from biopb_napari_widget.tensor_browser._widget import TensorBrowserWidget
+
+        w, _, _ = widget
+        w._list.sources = {s.source_id: s for s in sources}
+        # The fixture stubs this method out; call the real one directly.
+        TensorBrowserWidget._build_and_display_tree(w)
+        return [
+            w._tree_widget.topLevelItem(i).text(0)
+            for i in range(w._tree_widget.topLevelItemCount())
+        ]
+
+    def test_a_resolved_empty_source_gets_no_row(self, widget):
+        names = self._render(
+            widget,
+            [self._src("empty", tensors=[]), self._src("full", tensors=["full"])],
+        )
+        assert names == ["full.zarr  [8×8]"]
+
+    def test_an_unresolved_source_still_gets_its_row(self, widget):
+        # Its empty tensor list means "unknown", not "nothing" -- it still
+        # needs a row so a viewer can resolve it.
+        names = self._render(
+            widget, [self._src("cloud", tensors=[], is_resolved=False)]
+        )
+        assert names == ["cloud.zarr"]
+
+
 class TestRestoreSelection:
     """`_restore_selection` re-highlights the tracked row in a rebuilt tree (#191)."""
 
@@ -784,6 +830,25 @@ class TestUnresolvedHelper:
         from biopb_napari_widget.tensor_browser._widget import _is_unresolved
 
         assert not _is_unresolved(_source("c", tensors=[]))
+
+
+class TestEmptySourceHelper:
+    def test_resolved_with_nothing_on_it_is_empty(self):
+        from biopb_napari_widget.tensor_browser._widget import _is_empty_source
+
+        assert _is_empty_source(_source("c", tensors=[]))
+
+    def test_not_empty_once_it_lists_a_tensor(self):
+        from biopb_napari_widget.tensor_browser._widget import _is_empty_source
+
+        assert not _is_empty_source(_source("c", tensors=["c"]))
+
+    def test_never_empty_while_unresolved(self):
+        """An unresolved source's empty list means "unknown", not "nothing" --
+        it still needs its row so a viewer can resolve it."""
+        from biopb_napari_widget.tensor_browser._widget import _is_empty_source
+
+        assert not _is_empty_source(_source("c", tensors=[], is_resolved=False))
 
 
 class TestResolveAction:
