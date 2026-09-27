@@ -219,6 +219,24 @@ def _is_unresolved(src: CatalogSource) -> bool:
     return not src.is_resolved
 
 
+def _is_empty_source(src: CatalogSource) -> bool:
+    """A resolved source with nothing on it -- browsing into it would open an
+    empty node, so the tree leaves it out rather than rendering a dead end.
+
+    Gated on :func:`_is_unresolved` rather than ``tensors`` alone: an
+    unresolved source also lists no tensors, but for the opposite reason --
+    they are unknown, not absent -- and it still needs its row so a viewer can
+    resolve it.
+
+    ``len(src.tensors)`` is the raw catalog count, label sets included
+    (biopb/biopb#1059); that is fine here, since zero of that raw count means
+    there is truly nothing, image or label, to show.
+
+    Mirror of the SPA's ``isEmptySource`` (``web/packages/app/src/utils/sourceTree.ts``).
+    """
+    return not _is_unresolved(src) and len(src.tensors) == 0
+
+
 class _ResolveWorker(QThread):
     """Runs the blocking ``SourceList.resolve`` off the GUI thread.
 
@@ -1696,8 +1714,15 @@ class TensorBrowserWidget(QWidget):
         if not self._sources:
             return
 
-        # Build tree
-        root = _build_tree(self._sources)
+        # Build tree. Empty sources are dropped unconditionally, before a
+        # search filter narrows further -- a source with nothing on it is
+        # never worth a row, matching or not.
+        visible = {
+            source_id: src
+            for source_id, src in self._sources.items()
+            if not _is_empty_source(src)
+        }
+        root = _build_tree(visible)
 
         # Apply filter if provided
         display_tree = root
