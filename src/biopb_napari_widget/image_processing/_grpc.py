@@ -13,7 +13,7 @@ import biopb.image as proto
 import grpc
 import numpy as np
 import pandas as pd
-from biopb.image.utils import (
+from biopb.image import (
     deserialize_image_data,
     serialize_from_numpy_to_image_data,
 )
