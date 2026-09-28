@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, NamedTuple, Sequence, Set
 from urllib.parse import urlparse
 
-from biopb.control import is_local_url
+from biopb import is_local_url
 from biopb.tensor import Connection, ResolveCancelled, split_label_array_id
 from qtpy.QtCore import QRect, Qt, QThread, QTimer, Signal
 from qtpy.QtGui import QColor
