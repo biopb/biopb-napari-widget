@@ -876,6 +876,11 @@ def _label_client(image_desc, label_desc, scale_vec=None, unit_vec=None):
     return client
 
 
+def _stated_axes(axes):
+    """A set's ``metadata_json`` stating its ``image_axes``, as the server does."""
+    return json.dumps({"metadata": {"biopb": {"labels": {"image_axes": axes}}}})
+
+
 def _desc(array_id, shape, dim_labels, *, metadata_json="", pyramid=()):
     return SimpleNamespace(
         array_id=array_id,
@@ -926,15 +931,51 @@ class TestAlignLabelLevels:
         )
         assert aligned.shape == (64, 64)
 
+    def test_broadcasts_a_singleton_channel_axis(self):
+        # New-form set: image axes at image lengths, channel a singleton.
+        level = da.arange(5, dtype="uint32").reshape(5, 1, 1, 1, 1) * da.ones(
+            (5, 1, 4, 8, 8), dtype="uint32"
+        )
+        (aligned,) = align_label_levels([level], [5, 3, 4, 8, 8], [0, 1, 2, 3, 4])
+        assert aligned.shape == (5, 3, 4, 8, 8)
+        for channel in range(3):
+            assert int(np.asarray(aligned[3, channel, 0, 0, 0])) == 3
+
+    def test_old_form_set_still_takes_the_missing_axis_path(self):
+        level = da.zeros((5, 4, 8, 8), chunks=-1, dtype="uint32")
+        (aligned,) = align_label_levels([level], [5, 3, 4, 8, 8], [0, 2, 3, 4])
+        assert aligned.shape == (5, 3, 4, 8, 8)
+
+    def test_rgb_image_with_a_set_that_has_no_samples_axis(self):
+        level = da.zeros((5, 8, 8), chunks=-1, dtype="uint32")
+        (aligned,) = align_label_levels(
+            [level], [5, 8, 8, 3], [0, 1, 2], drop_samples=True
+        )
+        assert aligned.shape == (5, 8, 8)
+
+    def test_image_without_a_channel_axis(self):
+        level = da.zeros((5, 4, 8, 8), chunks=-1, dtype="uint32")
+        (aligned,) = align_label_levels([level], [5, 4, 8, 8], [0, 1, 2, 3])
+        assert aligned.shape == (5, 4, 8, 8)
+
+    def test_coarse_level_spatial_singleton_is_not_broadcast(self):
+        levels = [
+            da.zeros((1, 8, 8), chunks=-1, dtype="uint32"),
+            da.zeros((1, 1, 1), chunks=-1, dtype="uint32"),
+        ]
+        aligned = align_label_levels(levels, [3, 8, 8], [0, 1, 2])
+        assert [a.shape for a in aligned] == [(3, 8, 8), (3, 1, 1)]
+
 
 class TestAddTensorLayerRoutesALabelSet:
     def _pair(self, metadata_json=""):
         image = _desc("src0", [5, 3, 4, 64, 64], ["T", "C", "Z", "Y", "X"])
+        # New form: the image's axes, the channel axis a singleton.
         label = _desc(
             "src0/@labels/nuclei",
-            [5, 4, 64, 64],
-            ["T", "Z", "Y", "X"],
-            metadata_json=metadata_json,
+            [5, 1, 4, 64, 64],
+            ["T", "C", "Z", "Y", "X"],
+            metadata_json=metadata_json or _stated_axes([0, 1, 2, 3, 4]),
         )
         return image, label
 
@@ -1019,12 +1060,12 @@ class TestAddTensorLayerRoutesALabelSet:
         client = _make_physical_client(None)
         client.get_descriptor.side_effect = [label, RuntimeError("no image")]
         client.get_tensor.return_value = da.zeros(
-            (5, 4, 64, 64), chunks=-1, dtype="uint32"
+            (5, 1, 4, 64, 64), chunks=-1, dtype="uint32"
         )
 
         add_tensor_layer(viewer, client, "src0", label.array_id, label, name="nuclei")
 
-        assert viewer.add_labels.call_args[0][0].shape == (5, 4, 64, 64)
+        assert viewer.add_labels.call_args[0][0].shape == (5, 1, 4, 64, 64)
 
     def test_the_layer_is_not_editable(self):
         # A set is write-once on the server, and napari's brush on a
@@ -1078,7 +1119,12 @@ class TestALabelSetOnARealViewerModel:
 
     def _add(self, viewer, scale_vec=None, unit_vec=None):
         image = _desc("src0", [5, 3, 4, 64, 64], ["T", "C", "Z", "Y", "X"])
-        label = _desc("src0/@labels/nuclei", [5, 4, 64, 64], ["T", "Z", "Y", "X"])
+        label = _desc(
+            "src0/@labels/nuclei",
+            [5, 1, 4, 64, 64],
+            ["T", "C", "Z", "Y", "X"],
+            metadata_json=_stated_axes([0, 1, 2, 3, 4]),
+        )
         client = _label_client(image, label, scale_vec, unit_vec)
         return add_tensor_layer(
             viewer, client, "src0", label.array_id, label, name="nuclei"
@@ -1108,17 +1154,22 @@ class TestALabelSetOnARealViewerModel:
         assert list(layer.scale) == [1.0, 1.0, 2.0, 0.25, 0.5]
 
     def test_the_mask_is_there_at_every_channel(self):
-        # The whole reason the inserted axis is broadcast: a singleton one puts
+        # The whole reason the channel axis is broadcast: a singleton one puts
         # the layer outside its own extent at C>0 and napari draws nothing.
         image = _desc("src0", [2, 3, 8, 8], ["T", "C", "Y", "X"])
-        label = _desc("src0/@labels/n", [2, 8, 8], ["T", "Y", "X"])
+        label = _desc(
+            "src0/@labels/n",
+            [2, 1, 8, 8],
+            ["T", "C", "Y", "X"],
+            metadata_json=_stated_axes([0, 1, 2, 3]),
+        )
         client = _label_client(image, label)
 
         def _get_tensor(array_id, scale_hint=None, reduction_method=None):
             # Frame t is filled with id t+1, so a plane read off the wrong axis
             # is visible rather than merely empty.
-            block = da.arange(1, 3, dtype="uint32").reshape(2, 1, 1)
-            return block * da.ones((2, 8, 8), dtype="uint32")
+            block = da.arange(1, 3, dtype="uint32").reshape(2, 1, 1, 1)
+            return block * da.ones((2, 1, 8, 8), dtype="uint32")
 
         client.get_tensor.side_effect = _get_tensor
 

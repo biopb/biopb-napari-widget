@@ -482,6 +482,17 @@ def align_label_levels(levels, image_shape, image_axes, *, drop_samples=False):
     (the extent rule keeps S at full length) goes too.
     """
     missing = [i for i in range(len(image_shape)) if i not in set(image_axes)]
+    # A new-form set carries the channel axis as a singleton instead of leaving
+    # it out; broadcast it the same way. Decided on the base level only: a
+    # coarser level's spatial axis may shrink to 1 without being a channel axis.
+    singleton = []
+    if len(levels):
+        base = levels[0].shape
+        singleton = [
+            image_axes[k]
+            for k in range(len(image_axes))
+            if base[k] == 1 and int(image_shape[image_axes[k]]) > 1
+        ]
     aligned = []
     for level in levels:
         out = level
@@ -490,7 +501,7 @@ def align_label_levels(levels, image_shape, image_axes, *, drop_samples=False):
         for axis in missing:
             out = np.expand_dims(out, axis)
         target = list(out.shape)
-        for axis in missing:
+        for axis in missing + singleton:
             target[axis] = int(image_shape[axis])
         out = np.broadcast_to(out, tuple(target))
         if drop_samples:
