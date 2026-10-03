@@ -926,6 +926,41 @@ class TestAlignLabelLevels:
         )
         assert aligned.shape == (64, 64)
 
+    def test_broadcasts_a_singleton_channel_axis(self):
+        # New-form set: image axes at image lengths, channel a singleton.
+        level = da.arange(5, dtype="uint32").reshape(5, 1, 1, 1, 1) * da.ones(
+            (5, 1, 4, 8, 8), dtype="uint32"
+        )
+        (aligned,) = align_label_levels([level], [5, 3, 4, 8, 8], [0, 1, 2, 3, 4])
+        assert aligned.shape == (5, 3, 4, 8, 8)
+        for channel in range(3):
+            assert int(np.asarray(aligned[3, channel, 0, 0, 0])) == 3
+
+    def test_old_form_set_still_takes_the_missing_axis_path(self):
+        level = da.zeros((5, 4, 8, 8), chunks=-1, dtype="uint32")
+        (aligned,) = align_label_levels([level], [5, 3, 4, 8, 8], [0, 2, 3, 4])
+        assert aligned.shape == (5, 3, 4, 8, 8)
+
+    def test_rgb_image_with_a_set_that_has_no_samples_axis(self):
+        level = da.zeros((5, 8, 8), chunks=-1, dtype="uint32")
+        (aligned,) = align_label_levels(
+            [level], [5, 8, 8, 3], [0, 1, 2], drop_samples=True
+        )
+        assert aligned.shape == (5, 8, 8)
+
+    def test_image_without_a_channel_axis(self):
+        level = da.zeros((5, 4, 8, 8), chunks=-1, dtype="uint32")
+        (aligned,) = align_label_levels([level], [5, 4, 8, 8], [0, 1, 2, 3])
+        assert aligned.shape == (5, 4, 8, 8)
+
+    def test_coarse_level_spatial_singleton_is_not_broadcast(self):
+        levels = [
+            da.zeros((1, 8, 8), chunks=-1, dtype="uint32"),
+            da.zeros((1, 1, 1), chunks=-1, dtype="uint32"),
+        ]
+        aligned = align_label_levels(levels, [3, 8, 8], [0, 1, 2])
+        assert [a.shape for a in aligned] == [(3, 8, 8), (3, 1, 1)]
+
 
 class TestAddTensorLayerRoutesALabelSet:
     def _pair(self, metadata_json=""):
