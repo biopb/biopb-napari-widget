@@ -11,6 +11,7 @@ whole old list or the whole new one.
 
 from __future__ import annotations
 
+import inspect
 import logging
 import threading
 from typing import Dict
@@ -32,6 +33,16 @@ _SOURCES_SQL = (
     "SELECT source_id, source_url, source_type, is_resolved, tensors "
     "FROM sources ORDER BY source_id"
 )
+
+
+def _accepts_cloud(add_source) -> bool:
+    try:
+        params = inspect.signature(add_source).parameters
+    except (TypeError, ValueError):
+        return True  # cannot tell; let the SDK answer
+    return "cloud" in params or any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+    )
 
 
 class SourceList:
@@ -107,11 +118,18 @@ class SourceList:
     def add(self, path: str, *, cloud=False, on_progress=None, should_cancel=None):
         """Register *path*; *cloud* also registers its offline placeholders.
 
-        ``cloud`` is only sent when set, so a drop that does not need it works
-        against an SDK that predates the keyword.
+        ``cloud`` is only sent when set, and only to an SDK whose ``add_source``
+        takes it: against an older one the drop proceeds without it, as it did
+        before the keyword existed, rather than failing on an unknown argument.
         """
-        kwargs = {"cloud": True} if cloud else {}
-        result = self._client().add_source(
+        client = self._client()
+        kwargs = {}
+        if cloud:
+            if _accepts_cloud(client.add_source):
+                kwargs["cloud"] = True
+            else:
+                logger.warning("SDK add_source has no `cloud`; adding without it")
+        result = client.add_source(
             path, on_progress=on_progress, should_cancel=should_cancel, **kwargs
         )
         self.refresh()
