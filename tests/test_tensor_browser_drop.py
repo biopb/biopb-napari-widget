@@ -321,19 +321,19 @@ def test_declined_cloud_dialog_sends_nothing():
     widget._start_add.assert_not_called()
 
 
-@pytest.mark.parametrize("answer,redrops", [("Yes", True), ("No", False)])
-def test_skipped_offline_prompt_redrops_with_cloud(monkeypatch, answer, redrops):
-    asked = []
-
-    def _ask(*a, **k):
-        asked.append(a[2])
-        return getattr(_widget.QMessageBox, answer)
-
-    monkeypatch.setattr(_widget.QMessageBox, "question", _ask)
+def test_skipped_offline_is_reported_not_offered(monkeypatch):
+    # The server refuses a cloud re-drop of a folder that already registered
+    # something, so the notice must not offer one.
+    shown = []
+    monkeypatch.setattr(
+        _widget.QMessageBox, "information", lambda *a, **k: shown.append(a[2])
+    )
+    monkeypatch.setattr(
+        _widget.QMessageBox,
+        "question",
+        lambda *a, **k: pytest.fail("must not prompt"),
+    )
     widget = MagicMock()
     TensorBrowserWidget._on_add_skipped_offline(widget, "/dbx/data", 4)
-    assert "4 offline files" in asked[0]
-    if redrops:
-        widget._start_add.assert_called_once_with("/dbx/data", cloud=True)
-    else:
-        widget._start_add.assert_not_called()
+    assert "4 offline files" in shown[0]
+    widget._start_add.assert_not_called()

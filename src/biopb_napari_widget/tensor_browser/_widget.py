@@ -1626,24 +1626,20 @@ class TensorBrowserWidget(QWidget):
         self._report_failure("Add data failed", msg)
 
     def _on_add_skipped_offline(self, path: str, count: int):
-        """Offer to add the offline placeholders a drop left out.
+        """Tell the user how many offline files the drop left out.
 
-        The OneDrive dialog only recognizes OneDrive by name; Dropbox, iCloud
-        and other synced folders reach here instead, once the server says it
-        passed some over. Yes re-sends the drop with ``cloud=True``.
+        Information only. Re-sending the drop with ``cloud=True`` is not an
+        offer to make: once a drop has registered anything its folder is a known
+        root with cloud mode off, and the server refuses to switch that on
+        afterwards ("Cannot switch cloud mode on inside ...").
         """
         name = os.path.basename(path.rstrip("/\\")) or path
-        resp = QMessageBox.question(
+        QMessageBox.information(
             self,
-            "Add offline files?",
+            "Some files were not added",
             f"{count} offline file{'' if count == 1 else 's'} in “{name}” "
-            "were left out: their contents are not on this PC.\n\n"
-            "Add them as cloud sources? Opening one will download it first.",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
+            "were left out: their contents are not on this PC.",
         )
-        if resp == QMessageBox.Yes:
-            self._start_add(path, cloud=True)
 
     def _on_add_done(self, payload):
         """Terminal add tally: refresh, summarize, report failures."""
