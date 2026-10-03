@@ -249,3 +249,130 @@ def test_confirm_cloud_drop_prompts_only_under_cloud(monkeypatch):
         _widget.QMessageBox, "question", lambda *a, **k: _widget.QMessageBox.Yes
     )
     assert TensorBrowserWidget._confirm_cloud_drop(MagicMock(), "/od") is True
+
+
+def _run_worker(sources, cloud=False):
+    worker = _AddSourceWorker(sources, "/A", cloud)
+    skipped = []
+    worker.skipped_offline.connect(skipped.append)
+    worker.run()
+    return skipped
+
+
+def test_worker_sends_cloud_only_when_asked(_qapp):
+    sources = MagicMock()
+    sources.add.return_value = _result()
+    _run_worker(sources)
+    assert sources.add.call_args.kwargs["cloud"] is False
+    _run_worker(sources, cloud=True)
+    assert sources.add.call_args.kwargs["cloud"] is True
+
+
+@pytest.mark.parametrize(
+    "skipped,expect",
+    [(3, [3]), (0, []), (None, [])],  # None: an older result
+)
+def test_worker_reports_skipped_offline(_qapp, skipped, expect):
+    sources = MagicMock()
+    result = _result()
+    if skipped is None:
+        del result.skipped_offline
+    else:
+        result.skipped_offline = skipped
+    sources.add.return_value = result
+    assert _run_worker(sources) == expect
+
+
+def test_worker_does_not_ask_again_after_a_cloud_drop(_qapp):
+    sources = MagicMock()
+    result = _result()
+    result.skipped_offline = 2
+    sources.add.return_value = result
+    assert _run_worker(sources, cloud=True) == []
+
+
+def test_drop_of_a_confirmed_cloud_folder_sends_cloud(monkeypatch):
+    widget = MagicMock()
+    widget._can_accept_drop.return_value = (True, "")
+    widget._local_paths_from_mime.return_value = ["/od/OneDrive/data"]
+    widget._confirm_large_drop.return_value = True
+    widget._confirm_cloud_drop.return_value = True
+    TensorBrowserWidget.dropEvent(widget, MagicMock())
+    widget._start_add.assert_called_once_with("/od/OneDrive/data", cloud=True)
+
+
+def test_drop_of_an_ordinary_folder_does_not_send_cloud():
+    widget = MagicMock()
+    widget._can_accept_drop.return_value = (True, "")
+    widget._local_paths_from_mime.return_value = ["/data/plain"]
+    widget._confirm_large_drop.return_value = True
+    widget._confirm_cloud_drop.return_value = True
+    widget._confirm_cloud_redrop.return_value = False
+    TensorBrowserWidget.dropEvent(widget, MagicMock())
+    widget._start_add.assert_called_once_with("/data/plain", cloud=False)
+
+
+def test_declined_cloud_dialog_sends_nothing():
+    widget = MagicMock()
+    widget._can_accept_drop.return_value = (True, "")
+    widget._local_paths_from_mime.return_value = ["/od/OneDrive/data"]
+    widget._confirm_large_drop.return_value = True
+    widget._confirm_cloud_drop.return_value = False
+    TensorBrowserWidget.dropEvent(widget, MagicMock())
+    widget._start_add.assert_not_called()
+
+
+def test_skipped_offline_is_reported_not_offered(monkeypatch):
+    # The server refuses a cloud re-drop of a folder that already registered
+    # something, so the notice must not offer one.
+    shown = []
+    monkeypatch.setattr(
+        _widget.QMessageBox, "information", lambda *a, **k: shown.append(a[2])
+    )
+    monkeypatch.setattr(
+        _widget.QMessageBox,
+        "question",
+        lambda *a, **k: pytest.fail("must not prompt"),
+    )
+    widget = MagicMock()
+    TensorBrowserWidget._on_add_skipped_offline(widget, "/dbx/data", 4)
+    assert "4 offline files" in shown[0]
+    widget._start_add.assert_not_called()
+
+
+class _RedropStub:
+    def __init__(self, remembered=()):
+        self._skipped_offline_paths = set(remembered)
+
+
+@pytest.mark.parametrize("answer,expect", [("Yes", True), ("No", False)])
+def test_redrop_of_a_skipped_path_asks_about_cloud(monkeypatch, answer, expect):
+    asked = []
+
+    def _ask(*a, **k):
+        asked.append(a[2])
+        return getattr(_widget.QMessageBox, answer)
+
+    monkeypatch.setattr(_widget.QMessageBox, "question", _ask)
+    stub = _RedropStub({"/dbx/data"})
+    assert TensorBrowserWidget._confirm_cloud_redrop(stub, "/dbx/data") is expect
+    assert len(asked) == 1
+
+
+def test_redrop_of_another_path_does_not_ask(monkeypatch):
+    monkeypatch.setattr(
+        _widget.QMessageBox,
+        "question",
+        lambda *a, **k: pytest.fail("must not prompt"),
+    )
+    stub = _RedropStub({"/dbx/data"})
+    assert TensorBrowserWidget._confirm_cloud_redrop(stub, "/dbx/other") is False
+    assert TensorBrowserWidget._confirm_cloud_redrop(stub, "/dbx/data/sub") is False
+
+
+def test_skipped_offline_notice_remembers_the_path(monkeypatch):
+    monkeypatch.setattr(_widget.QMessageBox, "information", lambda *a, **k: None)
+    widget = MagicMock()
+    widget._skipped_offline_paths = set()
+    TensorBrowserWidget._on_add_skipped_offline(widget, "/dbx/data", 2)
+    assert widget._skipped_offline_paths == {"/dbx/data"}

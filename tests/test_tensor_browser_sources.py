@@ -132,3 +132,29 @@ class TestVerbs:
     def test_use_server_query_follows_the_size(self):
         listing, _ = _listing([str(i) for i in range(1001)])
         assert listing.use_server_query
+
+
+def test_add_sends_cloud_only_when_set():
+    client = MagicMock()
+    client.query_sources.return_value = []
+    conn = MagicMock(client=client)
+    sources = SourceList(conn)
+
+    sources.add("/A")
+    assert "cloud" not in client.add_source.call_args.kwargs
+    sources.add("/A", cloud=True)
+    assert client.add_source.call_args.kwargs["cloud"] is True
+
+
+def test_add_drops_cloud_for_an_sdk_that_does_not_take_it():
+    calls = []
+
+    def add_source(path, *, on_progress=None, should_cancel=None):
+        calls.append(path)
+
+    client = MagicMock()
+    client.query_sources.return_value = []
+    client.add_source = add_source
+    SourceList(SimpleNamespace(client=client)).add("/A", cloud=True)
+
+    assert calls == ["/A"]
