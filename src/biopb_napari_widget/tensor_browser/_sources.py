@@ -104,9 +104,15 @@ class SourceList:
             source_id, on_progress=on_progress, should_cancel=should_cancel
         )
 
-    def add(self, path: str, *, on_progress=None, should_cancel=None):
+    def add(self, path: str, *, cloud=False, on_progress=None, should_cancel=None):
+        """Register *path*; *cloud* also registers its offline placeholders.
+
+        ``cloud`` is only sent when set, so a drop that does not need it works
+        against an SDK that predates the keyword.
+        """
+        kwargs = {"cloud": True} if cloud else {}
         result = self._client().add_source(
-            path, on_progress=on_progress, should_cancel=should_cancel
+            path, on_progress=on_progress, should_cancel=should_cancel, **kwargs
         )
         self.refresh()
         return result

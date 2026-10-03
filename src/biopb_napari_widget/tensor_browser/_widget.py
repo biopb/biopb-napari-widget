@@ -494,11 +494,15 @@ class _AddSourceWorker(QThread):
     progress = Signal(object)  # AddSourceProgress
     done = Signal(object)  # (added, refreshed, removed, failed)
     failed = Signal(str)
+    # Offline placeholders the server passed over because `cloud` was not set;
+    # emitted after `done`, only when non-zero.
+    skipped_offline = Signal(int)
 
-    def __init__(self, sources: SourceList, path: str):
+    def __init__(self, sources: SourceList, path: str, cloud: bool = False):
         super().__init__()
         self._sources = sources
         self._path = path
+        self._cloud = cloud
         self._cancel = threading.Event()
 
     def request_cancel(self):
@@ -509,6 +513,7 @@ class _AddSourceWorker(QThread):
         try:
             result = self._sources.add(
                 self._path,
+                cloud=self._cloud,
                 on_progress=self.progress.emit,
                 should_cancel=self._cancel.is_set,
             )
@@ -523,6 +528,10 @@ class _AddSourceWorker(QThread):
         removed = list(result.removed)
         failed = [(f.path, f.reason) for f in result.failed]
         self.done.emit((added, refreshed, removed, failed))
+        # An older result has no such field, which reads as nothing skipped.
+        skipped = int(getattr(result, "skipped_offline", 0) or 0)
+        if skipped and not self._cloud:
+            self.skipped_offline.emit(skipped)
 
 
 class _RemoveSourceWorker(QThread):
@@ -1516,7 +1525,10 @@ class TensorBrowserWidget(QWidget):
             return  # user declined scanning an oversized folder; nothing sent
         if not self._confirm_cloud_drop(path):
             return  # user declined adding from a cloud-synced folder
-        self._start_add(path)
+        # A confirmed cloud drop is the user's say-so to register the offline
+        # placeholders too; any other folder is told if the server passed some
+        # over (`_on_add_skipped_offline`).
+        self._start_add(path, cloud=_cloud_drop_warning(path) is not None)
 
     def _confirm_large_drop(self, path: str) -> bool:
         """Ask before scanning a big folder; return True to proceed.
@@ -1566,17 +1578,20 @@ class TensorBrowserWidget(QWidget):
         )
         return resp == QMessageBox.Yes
 
-    def _start_add(self, path: str):
+    def _start_add(self, path: str, cloud: bool = False):
         """Spawn the off-GUI-thread add worker for *path* (non-modal)."""
         if self._add_worker is not None:
             return  # one add at a time
         self._clear_error()
-        worker = _AddSourceWorker(self._list, path)
+        worker = _AddSourceWorker(self._list, path, cloud)
         self._add_worker = worker
         self._add_retain.add(worker)
         worker.progress.connect(self._on_add_progress)
         worker.done.connect(self._on_add_done)
         worker.failed.connect(self._on_add_failed)
+        worker.skipped_offline.connect(
+            lambda n, p=path: self._on_add_skipped_offline(p, n)
+        )
         worker.finished.connect(lambda w=worker: self._add_retain.discard(w))
         self._add_cancel_btn.setVisible(True)
         label = os.path.basename(path.rstrip("/")) or path
@@ -1609,6 +1624,26 @@ class TensorBrowserWidget(QWidget):
         self._add_cancel_btn.setVisible(False)
         self._update_drop_hint()
         self._report_failure("Add data failed", msg)
+
+    def _on_add_skipped_offline(self, path: str, count: int):
+        """Offer to add the offline placeholders a drop left out.
+
+        The OneDrive dialog only recognizes OneDrive by name; Dropbox, iCloud
+        and other synced folders reach here instead, once the server says it
+        passed some over. Yes re-sends the drop with ``cloud=True``.
+        """
+        name = os.path.basename(path.rstrip("/\\")) or path
+        resp = QMessageBox.question(
+            self,
+            "Add offline files?",
+            f"{count} offline file{'' if count == 1 else 's'} in “{name}” "
+            "were left out: their contents are not on this PC.\n\n"
+            "Add them as cloud sources? Opening one will download it first.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if resp == QMessageBox.Yes:
+            self._start_add(path, cloud=True)
 
     def _on_add_done(self, payload):
         """Terminal add tally: refresh, summarize, report failures."""

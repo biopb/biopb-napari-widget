@@ -132,3 +132,15 @@ class TestVerbs:
     def test_use_server_query_follows_the_size(self):
         listing, _ = _listing([str(i) for i in range(1001)])
         assert listing.use_server_query
+
+
+def test_add_sends_cloud_only_when_set():
+    client = MagicMock()
+    client.query_sources.return_value = []
+    conn = MagicMock(client=client)
+    sources = SourceList(conn)
+
+    sources.add("/A")
+    assert "cloud" not in client.add_source.call_args.kwargs
+    sources.add("/A", cloud=True)
+    assert client.add_source.call_args.kwargs["cloud"] is True
