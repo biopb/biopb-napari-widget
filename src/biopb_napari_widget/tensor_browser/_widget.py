@@ -1015,6 +1015,10 @@ class TensorBrowserWidget(QWidget):
         # to the ``finished`` signal, mirroring the resolve/warm ownership rule.
         self._add_worker: _AddSourceWorker | None = None
         self._add_retain: set = set()
+        # Dropped paths whose last add left offline files out. The name check
+        # only knows OneDrive, so a re-drop of one of these is where the other
+        # synced folders get asked about cloud mode. Session-only.
+        self._skipped_offline_paths: set = set()
         # In-flight dropped-branch remove worker (at most one at a time), same
         # ownership rule as the add worker.
         self._remove_worker: _RemoveSourceWorker | None = None
@@ -1526,9 +1530,35 @@ class TensorBrowserWidget(QWidget):
         if not self._confirm_cloud_drop(path):
             return  # user declined adding from a cloud-synced folder
         # A confirmed cloud drop is the user's say-so to register the offline
-        # placeholders too; any other folder is told if the server passed some
-        # over (`_on_add_skipped_offline`).
-        self._start_add(path, cloud=_cloud_drop_warning(path) is not None)
+        # placeholders too. Any other folder is told if the server passed some
+        # over (`_on_add_skipped_offline`) and asked about cloud mode if it is
+        # dropped again.
+        cloud = _cloud_drop_warning(path) is not None or self._confirm_cloud_redrop(
+            path
+        )
+        self._start_add(path, cloud=cloud)
+
+    def _confirm_cloud_redrop(self, path: str) -> bool:
+        """Ask about cloud mode for a path whose last add left files out.
+
+        False without asking for any other path. The server only accepts cloud
+        mode on a folder it does not already hold, so this is the answer for a
+        folder removed and dropped again; for one still registered the server
+        refuses, and that message is shown as for any failed add.
+        """
+        if path not in self._skipped_offline_paths:
+            return False
+        name = os.path.basename(path.rstrip("/\\")) or path
+        resp = QMessageBox.question(
+            self,
+            "Add as cloud sources?",
+            f"Offline files in “{name}” were left out the last time it was "
+            "added.\n\nAdd it as a cloud folder this time, so they are "
+            "included? Opening one will download it first.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        return resp == QMessageBox.Yes
 
     def _confirm_large_drop(self, path: str) -> bool:
         """Ask before scanning a big folder; return True to proceed.
@@ -1592,6 +1622,11 @@ class TensorBrowserWidget(QWidget):
         worker.skipped_offline.connect(
             lambda n, p=path: self._on_add_skipped_offline(p, n)
         )
+        if cloud:
+            # Done, not failed: a refused cloud drop is still worth asking again.
+            worker.done.connect(
+                lambda _payload, p=path: self._skipped_offline_paths.discard(p)
+            )
         worker.finished.connect(lambda w=worker: self._add_retain.discard(w))
         self._add_cancel_btn.setVisible(True)
         label = os.path.basename(path.rstrip("/")) or path
@@ -1631,14 +1666,18 @@ class TensorBrowserWidget(QWidget):
         Information only. Re-sending the drop with ``cloud=True`` is not an
         offer to make: once a drop has registered anything its folder is a known
         root with cloud mode off, and the server refuses to switch that on
-        afterwards ("Cannot switch cloud mode on inside ...").
+        afterwards ("Cannot switch cloud mode on inside ..."). The path is
+        remembered, so dropping it again after removing it asks about cloud mode
+        (`_confirm_cloud_redrop`).
         """
+        self._skipped_offline_paths.add(path)
         name = os.path.basename(path.rstrip("/\\")) or path
         QMessageBox.information(
             self,
             "Some files were not added",
             f"{count} offline file{'' if count == 1 else 's'} in “{name}” "
-            "were left out: their contents are not on this PC.",
+            "were left out: their contents are not on this PC.\n\n"
+            "To include them, remove the folder and drop it again.",
         )
 
     def _on_add_done(self, payload):
