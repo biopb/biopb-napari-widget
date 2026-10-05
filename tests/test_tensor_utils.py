@@ -1,6 +1,5 @@
 """Tests for _tensor_utils shared utilities."""
 
-import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call
 
@@ -876,11 +875,6 @@ def _label_client(image_desc, label_desc, scale_vec=None, unit_vec=None):
     return client
 
 
-def _stated_axes(axes):
-    """A set's ``metadata_json`` stating its ``image_axes``, as the server does."""
-    return json.dumps({"metadata": {"biopb": {"labels": {"image_axes": axes}}}})
-
-
 def _desc(array_id, shape, dim_labels, *, metadata_json="", pyramid=()):
     return SimpleNamespace(
         array_id=array_id,
@@ -893,69 +887,39 @@ def _desc(array_id, shape, dim_labels, *, metadata_json="", pyramid=()):
 
 
 class TestAlignLabelLevels:
-    def test_broadcasts_the_channel_axis_the_set_does_not_have(self):
-        # napari right-aligns layers of differing rank, so a T Z Y X set beside
-        # a T C Z Y X image would put its T on the image's C.
-        level = da.zeros((5, 4, 64, 64), chunks=-1, dtype="uint32")
-        (aligned,) = align_label_levels([level], [5, 3, 4, 64, 64], [0, 2, 3, 4])
-        assert aligned.shape == (5, 3, 4, 64, 64)
-
-    def test_the_inserted_axis_is_broadcast_not_singleton(self):
-        # A singleton would put the layer outside its own extent at every
-        # channel but the first, where napari draws nothing rather than
-        # clamping -- the mask blanks as you flip channels.
-        level = da.arange(5, dtype="uint32").reshape(5, 1, 1) * da.ones(
-            (5, 8, 8), dtype="uint32"
-        )
-        (aligned,) = align_label_levels([level], [5, 3, 8, 8], [0, 2, 3])
-        assert aligned.shape == (5, 3, 8, 8)
-        for channel in range(3):
-            assert int(np.asarray(aligned[3, channel, 0, 0])) == 3
-
-    def test_each_level_keeps_its_own_extents(self):
-        # Only the missing axes take the image's length; a coarse level stays
-        # coarse in Y and X.
-        levels = [
-            da.zeros((4, 64, 64), chunks=-1, dtype="uint32"),
-            da.zeros((4, 16, 16), chunks=-1, dtype="uint32"),
-        ]
-        aligned = align_label_levels(levels, [4, 2, 64, 64], [0, 2, 3])
-        assert [a.shape for a in aligned] == [(4, 2, 64, 64), (4, 2, 16, 16)]
-
-    def test_drops_the_samples_axis_for_an_rgb_image(self):
-        # napari does not count interleaved samples as a layer dimension, so
-        # the set's copy of it (the extent rule keeps S) goes too.
-        level = da.zeros((64, 64, 3), chunks=-1, dtype="uint32")
-        (aligned,) = align_label_levels(
-            [level], [64, 64, 3], [0, 1, 2], drop_samples=True
-        )
-        assert aligned.shape == (64, 64)
-
     def test_broadcasts_a_singleton_channel_axis(self):
-        # New-form set: image axes at image lengths, channel a singleton.
+        # The set has the image's axes, the channel a singleton.
         level = da.arange(5, dtype="uint32").reshape(5, 1, 1, 1, 1) * da.ones(
             (5, 1, 4, 8, 8), dtype="uint32"
         )
-        (aligned,) = align_label_levels([level], [5, 3, 4, 8, 8], [0, 1, 2, 3, 4])
+        (aligned,) = align_label_levels([level], [5, 3, 4, 8, 8])
         assert aligned.shape == (5, 3, 4, 8, 8)
+        # Broadcast, not singleton: a singleton would put the layer outside its
+        # own extent at every channel but the first, and napari would draw
+        # nothing as you flip channels.
         for channel in range(3):
             assert int(np.asarray(aligned[3, channel, 0, 0, 0])) == 3
 
-    def test_old_form_set_still_takes_the_missing_axis_path(self):
-        level = da.zeros((5, 4, 8, 8), chunks=-1, dtype="uint32")
-        (aligned,) = align_label_levels([level], [5, 3, 4, 8, 8], [0, 2, 3, 4])
-        assert aligned.shape == (5, 3, 4, 8, 8)
+    def test_each_level_keeps_its_own_extents(self):
+        # Only the channel axis takes the image's length; a coarse level stays
+        # coarse in Y and X.
+        levels = [
+            da.zeros((4, 1, 64, 64), chunks=-1, dtype="uint32"),
+            da.zeros((4, 1, 16, 16), chunks=-1, dtype="uint32"),
+        ]
+        aligned = align_label_levels(levels, [4, 2, 64, 64])
+        assert [a.shape for a in aligned] == [(4, 2, 64, 64), (4, 2, 16, 16)]
 
-    def test_rgb_image_with_a_set_that_has_no_samples_axis(self):
-        level = da.zeros((5, 8, 8), chunks=-1, dtype="uint32")
-        (aligned,) = align_label_levels(
-            [level], [5, 8, 8, 3], [0, 1, 2], drop_samples=True
-        )
-        assert aligned.shape == (5, 8, 8)
+    def test_the_samples_axis_is_left_out(self):
+        # napari does not count interleaved samples as a layer dimension, and
+        # the set has none, so it lines up with the image minus that axis.
+        level = da.zeros((5, 1, 8, 8), chunks=-1, dtype="uint32")
+        (aligned,) = align_label_levels([level], [5, 3, 8, 8, 3], samples_axis=4)
+        assert aligned.shape == (5, 3, 8, 8)
 
     def test_image_without_a_channel_axis(self):
         level = da.zeros((5, 4, 8, 8), chunks=-1, dtype="uint32")
-        (aligned,) = align_label_levels([level], [5, 4, 8, 8], [0, 1, 2, 3])
+        (aligned,) = align_label_levels([level], [5, 4, 8, 8])
         assert aligned.shape == (5, 4, 8, 8)
 
     def test_coarse_level_spatial_singleton_is_not_broadcast(self):
@@ -963,19 +927,18 @@ class TestAlignLabelLevels:
             da.zeros((1, 8, 8), chunks=-1, dtype="uint32"),
             da.zeros((1, 1, 1), chunks=-1, dtype="uint32"),
         ]
-        aligned = align_label_levels(levels, [3, 8, 8], [0, 1, 2])
+        aligned = align_label_levels(levels, [3, 8, 8])
         assert [a.shape for a in aligned] == [(3, 8, 8), (3, 1, 1)]
 
 
 class TestAddTensorLayerRoutesALabelSet:
-    def _pair(self, metadata_json=""):
+    def _pair(self):
         image = _desc("src0", [5, 3, 4, 64, 64], ["T", "C", "Z", "Y", "X"])
         # New form: the image's axes, the channel axis a singleton.
         label = _desc(
             "src0/@labels/nuclei",
             [5, 1, 4, 64, 64],
             ["T", "C", "Z", "Y", "X"],
-            metadata_json=metadata_json or _stated_axes([0, 1, 2, 3, 4]),
         )
         return image, label
 
@@ -1017,39 +980,17 @@ class TestAddTensorLayerRoutesALabelSet:
         assert viewer.add_labels.call_args[1]["scale"] == [1.0, 1.0, 2.0, 0.25, 0.5]
         client.get_physical_scale.assert_called_once_with("src0")
 
-    def test_prefers_the_mapping_the_server_states(self):
-        # The stated mapping wins over the rule re-derived. Here a set spanning
-        # C Z Y X says so; the rule would have derived T Z Y X from the ranks
-        # alone and broadcast the wrong axis.
-        stated = json.dumps(
-            {"metadata": {"biopb": {"labels": {"image_axes": [1, 2, 3, 4]}}}}
-        )
-        image, label = self._pair(metadata_json=stated)
-        label.shape = [3, 4, 64, 64]
+    def test_a_set_of_another_rank_stays_at_its_own_rank(self):
+        # An older server's channel-less set: not the image's rank, so it is not
+        # aligned (nothing is inserted) and keeps its own shape.
+        image, label = self._pair()
+        label.shape = [5, 4, 64, 64]
         viewer = MagicMock()
         client = _label_client(image, label)
 
         add_tensor_layer(viewer, client, "src0", label.array_id, label, name="nuclei")
 
-        # T broadcast (the stated axis 0 is absent), not C.
-        assert viewer.add_labels.call_args[0][0].shape == (5, 3, 4, 64, 64)
-
-    def test_a_reordering_mapping_is_refused_rather_than_mislaid(self):
-        # Alignment inserts and never permutes, which the extent rule makes
-        # sufficient. A mapping that would need a transpose is a server the
-        # rule no longer describes; inserting into it would put every axis
-        # somewhere wrong without saying so.
-        stated = json.dumps(
-            {"metadata": {"biopb": {"labels": {"image_axes": [2, 0, 3, 4]}}}}
-        )
-        image, label = self._pair(metadata_json=stated)
-        label.shape = [4, 5, 64, 64]
-        viewer = MagicMock()
-        client = _label_client(image, label)
-
-        add_tensor_layer(viewer, client, "src0", label.array_id, label, name="nuclei")
-
-        assert viewer.add_labels.call_args[0][0].shape == (4, 5, 64, 64)
+        assert viewer.add_labels.call_args[0][0].shape == (5, 4, 64, 64)
 
     def test_an_unbound_set_is_still_a_labels_layer(self):
         # An image that cannot be described leaves nothing to align to. The
@@ -1123,7 +1064,6 @@ class TestALabelSetOnARealViewerModel:
             "src0/@labels/nuclei",
             [5, 1, 4, 64, 64],
             ["T", "C", "Z", "Y", "X"],
-            metadata_json=_stated_axes([0, 1, 2, 3, 4]),
         )
         client = _label_client(image, label, scale_vec, unit_vec)
         return add_tensor_layer(
@@ -1161,7 +1101,6 @@ class TestALabelSetOnARealViewerModel:
             "src0/@labels/n",
             [2, 1, 8, 8],
             ["T", "C", "Y", "X"],
-            metadata_json=_stated_axes([0, 1, 2, 3]),
         )
         client = _label_client(image, label)
 
