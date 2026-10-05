@@ -54,6 +54,13 @@ class CatalogSource:
     #: resolved" with "resolved, and there was nothing readable in it"
     #: (biopb/biopb#1032).
     is_resolved: bool = True
+    #: Why an unresolved source is unresolved: ``needs_recall`` (a cloud
+    #: placeholder, resolving downloads it), ``pending`` (the server has not
+    #: registered it yet; resolving is local and cheap), ``failed`` (its
+    #: registration raised), or ``None`` for a resolved source or a server whose
+    #: ``sources`` table has no such column. An unresolved source with ``None``
+    #: is a cloud one, as ``is_resolved = false`` meant before the column.
+    unresolved_reason: str | None = None
 
 
 def source_from_row(row: Mapping[str, Any]) -> CatalogSource:
@@ -76,6 +83,7 @@ def source_from_row(row: Mapping[str, Any]) -> CatalogSource:
         # it costs a resolve the UI does not offer, never a browse that silently
         # treats a real source as a placeholder.
         is_resolved=bool(row.get("is_resolved", True)),
+        unresolved_reason=row.get("unresolved_reason") or None,
     )
 
 

@@ -29,10 +29,22 @@ WATCH_MIN_INTERVAL_S = 2.0
 WATCH_MAX_INTERVAL_S = 60.0
 
 #: The columns ``_catalog`` decodes.
-_SOURCES_SQL = (
-    "SELECT source_id, source_url, source_type, is_resolved, tensors "
-    "FROM sources ORDER BY source_id"
-)
+_BASE_COLUMNS = "source_id, source_url, source_type, is_resolved, tensors"
+
+
+def _sources_sql(client) -> str:
+    """The listing query. An SDK with ``source_row_columns`` adds
+    ``unresolved_reason`` when the server's schema has it; an older one gets the
+    base columns, and a row without a reason reads as a cloud source."""
+    columns = _BASE_COLUMNS
+    try:
+        probed = client.source_row_columns()
+    except Exception:  # noqa: BLE001 - absent or failing probe: base columns
+        logger.debug("source_row_columns unavailable; using base columns")
+    else:
+        if isinstance(probed, str) and probed:
+            columns = probed
+    return f"SELECT {columns} FROM sources ORDER BY source_id"
 
 
 def _accepts_cloud(add_source) -> bool:
@@ -75,7 +87,8 @@ class SourceList:
 
     def refresh(self) -> Dict[str, CatalogSource]:
         """Re-list the whole catalog from the server."""
-        rows = self._client().query_sources(_SOURCES_SQL, format="records")
+        client = self._client()
+        rows = client.query_sources(_sources_sql(client), format="records")
         self.sources = {s.source_id: s for s in sources_from_rows(rows)}
         return self.sources
 
@@ -88,6 +101,15 @@ class SourceList:
     def scan_in_progress(self) -> bool:
         h = self.last_health
         return bool(h.get("full_scan_in_progress")) if h else False
+
+    def registration_pending(self) -> int:
+        """Sources the server has found and not yet registered; 0 on a server
+        whose health has no such field."""
+        h = self.last_health
+        try:
+            return int(h.get("registration_pending") or 0) if h else 0
+        except (TypeError, ValueError):
+            return 0
 
     def scan_source_count(self) -> int:
         h = self.last_health
@@ -105,8 +127,15 @@ class SourceList:
         )
         self.refresh()
         # The row this resolve committed, not the refreshed entry, which a
-        # concurrent rescan could have re-registered underneath.
-        return source_from_row(row)
+        # concurrent rescan could have re-registered underneath. It also lands in
+        # the listing if the re-list still shows the source unresolved (a pending
+        # source registers without moving the count), so the tree can repaint
+        # from it.
+        resolved = source_from_row(row)
+        current = self.sources.get(resolved.source_id)
+        if resolved.is_resolved and (current is None or not current.is_resolved):
+            self.sources = {**self.sources, resolved.source_id: resolved}
+        return resolved
 
     def warm(self, source_id: str, *, on_progress=None, should_cancel=None):
         """Recall a multi-file source's members. Residency is not in the
@@ -147,7 +176,8 @@ class SourceList:
         min_interval: float = WATCH_MIN_INTERVAL_S,
         max_interval: float = WATCH_MAX_INTERVAL_S,
     ) -> None:
-        """Re-list whenever the server's ``source_count`` changes.
+        """Re-list whenever the server's ``source_count`` or
+        ``registration_pending`` changes.
 
         A catalog listed while the server was still indexing then fills itself
         in. A thread, not a ``QTimer``: ``health_check`` blocks. Idempotent.
@@ -171,11 +201,14 @@ class SourceList:
         ``None`` while disconnected, so the first connected poll compares
         against what was listed at connect and catches a mid-index partial.
 
-        A source that gains tensors without a new source is not caught: the
-        count does not move.
+        A registration changes neither the count nor the scan flag, so while the
+        server reports ``registration_pending`` the pending figure is watched
+        too, and the poll does not back off to a standstill. A source that
+        gains tensors any other way is not caught.
         """
         interval = min_interval
         last_count: int | None = None
+        last_pending = 0
         while not self._watch_stop.wait(interval):
             if self._conn.client is None:
                 last_count = None
@@ -192,10 +225,14 @@ class SourceList:
                 continue
             if last_count is None:
                 last_count = len(self.sources)
-            if count != last_count:
+            pending = self.registration_pending()
+            if count != last_count or pending != last_pending:
                 self._relist()
                 last_count = count
+                last_pending = pending
                 interval = min_interval
+            elif pending:
+                interval = min_interval  # registering: keep the tree filling in
             else:
                 interval = min(interval * 2, max_interval)
 
