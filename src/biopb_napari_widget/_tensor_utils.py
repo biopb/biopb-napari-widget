@@ -10,7 +10,7 @@ from contextlib import contextmanager
 from typing import List, Tuple
 
 import numpy as np
-from biopb.tensor import TensorFlightClient, label_image_axes, split_label_array_id
+from biopb.tensor import TensorFlightClient, split_label_array_id
 
 logger = logging.getLogger(__name__)
 
@@ -412,27 +412,21 @@ def _label_binding(client, tensor_id: str, tensor_desc):
 
     ``None`` when *tensor_id* names no set -- the path is the only thing that
     marks one (``biopb.tensor.split_label_array_id``). Otherwise
-    ``(label_desc, image_desc, image_axes)``: the set's own descriptor, its
-    image's, and for each axis of the set the index of the image axis it
-    indexes. Either of the last two is ``None`` when the image cannot be
-    described or the set does not span it, which leaves the set a Labels layer
-    at its own rank rather than a failure.
+    ``(label_desc, image_desc)``: the set's own descriptor and its image's.
+    *image_desc* is ``None`` when the image cannot be described, which leaves
+    the set a Labels layer at its own rank rather than a failure.
 
-    The set's descriptor is re-fetched because the lean catalog row carries
-    neither the pyramid ``build_pyramid_levels`` needs nor the metadata holding
-    the server's stated axis mapping -- one call answers both, where letting
-    each ask separately would open the tensor twice.
+    The set's descriptor is re-fetched because the lean catalog row does not
+    carry the pyramid ``build_pyramid_levels`` needs.
     """
     address = split_label_array_id(tensor_id)
     if address is None:
         return None
     try:
-        label_desc = client.get_descriptor(
-            tensor_id, with_pyramid=True, with_metadata=True
-        )
+        label_desc = client.get_descriptor(tensor_id, with_pyramid=True)
     except Exception:  # noqa: BLE001 - advisory; the catalog row still draws
         logger.warning("Label descriptor lookup failed for %s", tensor_id)
-        return tensor_desc, None, None
+        return tensor_desc, None
     try:
         image_desc = client.get_descriptor(address.image_array_id)
     except Exception:  # noqa: BLE001 - advisory; see the docstring
@@ -441,73 +435,42 @@ def _label_binding(client, tensor_id: str, tensor_desc):
             tensor_id,
             address.image_array_id,
         )
-        return label_desc, None, None
-    axes = label_image_axes(label_desc, image_desc)
-    if axes is not None and list(axes) != sorted(axes):
-        # Alignment inserts the missing axes and never permutes, which the
-        # extent rule makes sufficient: a set's axes are the image's in the
-        # image's own order. A mapping that says otherwise is a server the rule
-        # no longer describes, and inserting into it would mislay every axis
-        # silently -- so nothing is aligned and the warning says why.
-        logger.warning(
-            "Label set %s states a reordering axis mapping %s; not aligning",
-            tensor_id,
-            list(axes),
-        )
-        axes = None
-    return label_desc, image_desc, axes
+        return label_desc, None
+    return label_desc, image_desc
 
 
-def align_label_levels(levels, image_shape, image_axes, *, drop_samples=False):
-    """Each level of a label set, reshaped onto its image layer's axes.
+def align_label_levels(levels, image_shape, samples_axis=None):
+    """Each level of a label set, broadcast onto its image layer's shape.
 
-    napari aligns layers of differing rank from the **right**, so a ``T Z Y X``
-    set added beside a ``T C Z Y X`` image would slide its T onto the image's
-    channel axis -- frame 0 shown where frame 40 was asked for, a picture rather
-    than an error. Giving the layer the image's own rank makes napari's
-    positional alignment the correct one, and *image_axes* says where the set's
-    axes land. It must be **ascending** -- this inserts, it does not permute,
-    which the extent rule makes sufficient; :func:`_label_binding` rejects a
-    mapping that would need a transpose.
+    A set has the image's axes in the image's order, with the channel axis a
+    singleton, and an interleaved RGB(A) samples axis (*samples_axis*, an index
+    into *image_shape*) left out -- napari does not count it as a layer
+    dimension either. So the set lines up with the image by position, and the
+    caller has checked its rank (:func:`_label_rank_matches`).
 
-    The image axes a set does not have are its channel axes, and they are
-    **broadcast, not left singleton**: a singleton puts the layer outside its
-    own extent at every channel but the first, where napari draws nothing rather
-    than clamping -- the mask blanks as you flip channels. A broadcast axis is a
-    view, mapping the whole span onto the one underlying chunk, so the mask
-    shows on every channel for a single read.
-
-    *drop_samples* for an image whose layer is ``rgb``: napari does not count
-    the interleaved samples axis as a layer dimension, so the set's copy of it
-    (the extent rule keeps S at full length) goes too.
+    A singleton axis whose image length is greater than 1 is **broadcast**: left
+    singleton it puts the layer outside its own extent at every channel but the
+    first, where napari draws nothing rather than clamping -- the mask blanks as
+    you flip channels. A broadcast axis is a view, mapping the whole span onto
+    the one underlying chunk, so the mask shows on every channel for a single
+    read. Decided on the base level only: a coarser level's spatial axis may
+    shrink to 1 without being a channel axis.
     """
-    missing = [i for i in range(len(image_shape)) if i not in set(image_axes)]
-    # A new-form set carries the channel axis as a singleton instead of leaving
-    # it out; broadcast it the same way. Decided on the base level only: a
-    # coarser level's spatial axis may shrink to 1 without being a channel axis.
-    singleton = []
-    if len(levels):
-        base = levels[0].shape
-        singleton = [
-            image_axes[k]
-            for k in range(len(image_axes))
-            if base[k] == 1 and int(image_shape[image_axes[k]]) > 1
-        ]
+    shape = [int(n) for k, n in enumerate(image_shape) if k != samples_axis]
+    base = levels[0].shape
+    singleton = [k for k, n in enumerate(shape) if base[k] == 1 and n > 1]
     aligned = []
     for level in levels:
-        out = level
-        # Ascending, so each insert lands at its own index in image space:
-        # earlier inserts have already shifted what follows.
-        for axis in missing:
-            out = np.expand_dims(out, axis)
-        target = list(out.shape)
-        for axis in missing + singleton:
-            target[axis] = int(image_shape[axis])
-        out = np.broadcast_to(out, tuple(target))
-        if drop_samples:
-            out = out[..., 0]
-        aligned.append(out)
+        target = list(level.shape)
+        for k in singleton:
+            target[k] = shape[k]
+        aligned.append(np.broadcast_to(level, tuple(target)))
     return aligned
+
+
+def _label_rank_matches(levels, image_desc, samples_axis) -> bool:
+    """Whether the set has the image's rank, less a samples axis."""
+    return levels[0].ndim == len(image_desc.shape) - (samples_axis is not None)
 
 
 def _add_label_layer(
@@ -517,7 +480,6 @@ def _add_label_layer(
     levels,
     label_desc,
     image_desc,
-    image_axes,
     *,
     name: str,
     compute_scheduler: str | None,
@@ -532,14 +494,13 @@ def _add_label_layer(
     """
     from ._viewer_compute import wrap_levels
 
-    if image_axes is not None and image_desc is not None:
+    s_idx = None
+    aligned = image_desc is not None
+    if aligned:
         _, _, _, s_idx = _resolve_axes(image_desc.shape, image_desc.dim_labels)
-        levels = align_label_levels(
-            levels,
-            image_desc.shape,
-            image_axes,
-            drop_samples=s_idx is not None,
-        )
+        aligned = _label_rank_matches(levels, image_desc, s_idx)
+    if aligned:
+        levels = align_label_levels(levels, image_desc.shape, s_idx)
         # An aligned set has the image's axes, and by the extent rule the image's
         # grid, so the image's physical sizes are the layer's scale vector and
         # its names are the layer's axis names.
