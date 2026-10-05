@@ -219,6 +219,27 @@ def _is_unresolved(src: CatalogSource) -> bool:
     return not src.is_resolved
 
 
+#: Reasons a source is unresolved other than a cloud placeholder, with the row
+#: suffix each gets.
+_UNRESOLVED_BADGES = {"pending": "  [indexing…]", "failed": "  [failed]"}
+
+
+def _needs_recall(src: CatalogSource) -> bool:
+    """An unresolved source whose resolve downloads a cloud file, so it needs the
+    user's consent. Anything the server has not said is ``pending`` or ``failed``
+    counts, including an older server that gives no reason at all."""
+    return _is_unresolved(src) and src.unresolved_reason not in _UNRESOLVED_BADGES
+
+
+def _unresolved_badge(src: CatalogSource) -> str:
+    """Row suffix for a source the server has not registered: it is being
+    indexed in the background, or that failed. Empty for a cloud placeholder
+    and for a resolved source."""
+    if not _is_unresolved(src):
+        return ""
+    return _UNRESOLVED_BADGES.get(src.unresolved_reason, "")
+
+
 def _is_empty_source(src: CatalogSource) -> bool:
     """A resolved source with nothing on it -- browsing into it would open an
     empty node, so the tree leaves it out rather than rendering a dead end.
@@ -1864,6 +1885,8 @@ class TensorBrowserWidget(QWidget):
             elif len(groups) > 1:
                 # Show tensor count
                 display_name = f"{node.name}  [{len(groups)} tensors]"
+            else:
+                display_name = f"{node.name}{_unresolved_badge(src)}"
 
             # No residency indicator. Drawing one cost a live stat walk per
             # source on every browse, and it was painted from a listing
@@ -2086,8 +2109,9 @@ class TensorBrowserWidget(QWidget):
             source_id = item.data(0, Qt.ItemDataRole.UserRole)
             src = self._sources.get(source_id)
             if src and _is_unresolved(src):
-                # Cloud / unresolved source: double-click triggers an explicit,
-                # consented resolve (downloads the file), not a viewer add.
+                # Unresolved source: double-click resolves it rather than adding
+                # to the viewer -- after consent for a cloud download, at once
+                # for a pending one, and as a retry for a failed one.
                 self._resolve_source(source_id)
                 return
             sole = _sole_image(src) if src else None
@@ -2138,7 +2162,14 @@ class TensorBrowserWidget(QWidget):
         # Primary action: Resolve (unresolved/cloud), "View all" (multi-tensor),
         # or "View" (single tensor).
         if is_unresolved_source:
-            resolve_action = menu.addAction("Resolve (downloads file)…")
+            assert src is not None
+            if _needs_recall(src):
+                label = "Resolve (downloads file)…"
+            elif src.unresolved_reason == "failed":
+                label = "Retry loading"
+            else:
+                label = "Load now"
+            resolve_action = menu.addAction(label)
             resolve_action.triggered.connect(lambda: self._resolve_source(source_id))
         elif is_multi_tensor_source:
             view_action = menu.addAction("View all")
@@ -2173,11 +2204,13 @@ class TensorBrowserWidget(QWidget):
         menu.exec_(self._tree_widget.mapToGlobal(pos))
 
     def _resolve_source(self, source_id: str):
-        """Warn, then resolve an unresolved (cloud) source off the GUI thread.
+        """Resolve an unresolved source off the GUI thread.
 
-        Resolving downloads the source's whole file, so we (1) take explicit
-        consent via a modal warning, then (2) run the blocking resolve in a worker
-        thread behind a modal progress dialog — the user is blocked from other
+        A cloud source (``needs_recall``) downloads its whole file, so we (1)
+        take explicit consent via a modal warning. A ``pending`` source is only
+        waiting for the server to register it -- nothing is downloaded -- and a
+        ``failed`` one is a retry, so both skip the warning. Then (2) run the
+        blocking resolve in a worker thread behind a modal progress dialog — the user is blocked from other
         actions but the UI stays painted — and (3) on success repopulate the tree
         from the now-resolved field list. The repopulate is necessary because
         resolution does not change the server ``source_count``, so the background
@@ -2190,17 +2223,19 @@ class TensorBrowserWidget(QWidget):
         parts = _get_path_parts(src.source_url)
         name = parts[-1] if parts else source_id
 
-        confirm = QMessageBox.warning(
-            self,
-            "Resolve cloud source",
-            f"Resolving “{name}” downloads the entire file from remote "
-            f"storage.\n\nThis may take several minutes, use local disk space, "
-            f"and will not work offline. Continue?",
-            QMessageBox.Ok | QMessageBox.Cancel,
-            QMessageBox.Cancel,
-        )
-        if confirm != QMessageBox.Ok:
-            return
+        recall = _needs_recall(src)
+        if recall:
+            confirm = QMessageBox.warning(
+                self,
+                "Resolve cloud source",
+                f"Resolving “{name}” downloads the entire file from remote "
+                f"storage.\n\nThis may take several minutes, use local disk "
+                f"space, and will not work offline. Continue?",
+                QMessageBox.Ok | QMessageBox.Cancel,
+                QMessageBox.Cancel,
+            )
+            if confirm != QMessageBox.Ok:
+                return
 
         self._clear_error()
 
@@ -2210,8 +2245,9 @@ class TensorBrowserWidget(QWidget):
         # manage close ourselves (autoClose/autoReset off) so that hitting Cancel
         # shows a "Cancelling…" state and the dialog stays up until the worker
         # confirms the stop — which also blocks a second resolve in the meantime.
-        progress = QProgressDialog(f"Resolving “{name}”…", "Cancel", 0, 0, self)
-        progress.setWindowTitle("Resolving")
+        verb = "Resolving" if recall else "Loading"
+        progress = QProgressDialog(f"{verb} “{name}”…", "Cancel", 0, 0, self)
+        progress.setWindowTitle(verb)
         progress.setWindowModality(Qt.WindowModal)
         progress.setMinimumDuration(0)
         progress.setAutoClose(False)
@@ -2226,7 +2262,7 @@ class TensorBrowserWidget(QWidget):
 
         def _on_progress(p):
             elapsed = int(p.elapsed_seconds)
-            label = f"Resolving “{p.target_name or name}”… {elapsed}s"
+            label = f"{verb} “{p.target_name or name}”… {elapsed}s"
             if p.target_bytes:
                 label += f" ({_human_bytes(p.target_bytes)})"
             progress.setLabelText(label)

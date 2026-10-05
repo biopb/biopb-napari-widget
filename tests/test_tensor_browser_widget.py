@@ -755,7 +755,9 @@ def _user_role():
     return Qt.ItemDataRole.UserRole
 
 
-def _source(source_id, *, tensors, source_type="", is_resolved=True):
+def _source(
+    source_id, *, tensors, source_type="", is_resolved=True, unresolved_reason=None
+):
     """A catalog row. ``is_resolved`` is independent of ``tensors`` on purpose:
     the two are what biopb/biopb#1032 stopped conflating."""
     from biopb_napari_widget._catalog import CatalogSource, CatalogTensor
@@ -765,6 +767,7 @@ def _source(source_id, *, tensors, source_type="", is_resolved=True):
         source_url=f"/cloud/{source_id}.zarr",
         source_type=source_type,
         is_resolved=is_resolved,
+        unresolved_reason=unresolved_reason,
         tensors=tuple(
             CatalogTensor(array_id=tid, shape=(8, 8), dtype="uint8") for tid in tensors
         ),
@@ -832,6 +835,33 @@ class TestUnresolvedHelper:
         assert not _is_unresolved(_source("c", tensors=[]))
 
 
+class TestUnresolvedReasonHelpers:
+    def test_only_a_cloud_or_unexplained_source_needs_consent(self):
+        from biopb_napari_widget.tensor_browser._widget import _needs_recall
+
+        def src(reason, resolved=False):
+            return _source(
+                "c", tensors=[], is_resolved=resolved, unresolved_reason=reason
+            )
+
+        assert _needs_recall(src("needs_recall"))
+        assert _needs_recall(src(None))  # older server: is_resolved alone
+        assert not _needs_recall(src("pending"))
+        assert not _needs_recall(src("failed"))
+        assert not _needs_recall(src(None, resolved=True))
+
+    def test_badge_only_for_pending_and_failed(self):
+        from biopb_napari_widget.tensor_browser._widget import _unresolved_badge
+
+        def src(reason):
+            return _source("c", tensors=[], is_resolved=False, unresolved_reason=reason)
+
+        assert "indexing" in _unresolved_badge(src("pending"))
+        assert "failed" in _unresolved_badge(src("failed"))
+        assert _unresolved_badge(src("needs_recall")) == ""
+        assert _unresolved_badge(src(None)) == ""
+
+
 class TestEmptySourceHelper:
     def test_resolved_with_nothing_on_it_is_empty(self):
         from biopb_napari_widget.tensor_browser._widget import _is_empty_source
@@ -854,7 +884,7 @@ class TestEmptySourceHelper:
 class TestResolveAction:
     """Double-click / context-menu on an unresolved source resolves it off-thread."""
 
-    def _arm(self, widget, monkeypatch, *, accept, outcome):
+    def _arm(self, widget, monkeypatch, *, accept, outcome, reason=None):
         """Wire a widget so _resolve_source runs without Qt threads/modals.
 
         ``accept`` chooses the warning-dialog answer; ``outcome`` is the fake
@@ -864,7 +894,11 @@ class TestResolveAction:
 
         w, conn, _ = widget
         conn.client = MagicMock()
-        w._list.sources = {"cloud_x": _source("cloud_x", tensors=[], is_resolved=False)}
+        w._list.sources = {
+            "cloud_x": _source(
+                "cloud_x", tensors=[], is_resolved=False, unresolved_reason=reason
+            )
+        }
 
         answer = widget_mod.QMessageBox.Ok if accept else widget_mod.QMessageBox.Cancel
         monkeypatch.setattr(
@@ -924,6 +958,33 @@ class TestResolveAction:
         # it and the user doesn't lose track of it (issue #191).
         assert w._selected_source_id == "cloud_x"
         assert w._selected_tensor_id is None
+
+    @pytest.mark.parametrize("reason", ["pending", "failed"])
+    def test_pending_or_failed_resolves_without_the_cloud_warning(
+        self, widget, monkeypatch, reason
+    ):
+
+        w, started = self._arm(
+            widget,
+            monkeypatch,
+            accept=False,  # a warning, if shown, would be declined
+            outcome=("resolved", _source("cloud_x", tensors=["cloud_x"])),
+            reason=reason,
+        )
+        w._resolve_source("cloud_x")
+        assert started["n"] == 1
+        w._apply_filter.assert_called_once()
+
+    def test_needs_recall_still_asks(self, widget, monkeypatch):
+        w, started = self._arm(
+            widget,
+            monkeypatch,
+            accept=False,
+            outcome=("resolved", object()),
+            reason="needs_recall",
+        )
+        w._resolve_source("cloud_x")
+        assert started["n"] == 0
 
     def test_failure_surfaces_error(self, widget, monkeypatch):
         # A failed user-initiated resolve reports via a modal box, not the

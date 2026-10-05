@@ -158,3 +158,51 @@ def test_add_drops_cloud_for_an_sdk_that_does_not_take_it():
     SourceList(SimpleNamespace(client=client)).add("/A", cloud=True)
 
     assert calls == ["/A"]
+
+
+class TestUnresolvedReason:
+    def test_listing_asks_for_the_columns_the_sdk_projects(self):
+        client = MagicMock()
+        client.source_row_columns.return_value = (
+            "source_id, is_resolved, unresolved_reason"
+        )
+        client.query_sources.return_value = []
+        SourceList(SimpleNamespace(client=client)).refresh()
+        sql = client.query_sources.call_args[0][0]
+        assert "unresolved_reason" in sql
+
+    def test_an_sdk_without_the_projector_lists_the_base_columns(self):
+        client = MagicMock(spec=["query_sources"])
+        client.query_sources.return_value = []
+        SourceList(SimpleNamespace(client=client)).refresh()
+        sql = client.query_sources.call_args[0][0]
+        assert "unresolved_reason" not in sql and "is_resolved" in sql
+
+    def test_the_reason_is_carried_and_absent_on_an_older_server(self):
+        from biopb_napari_widget._catalog import source_from_row
+
+        row = {"source_id": "a", "is_resolved": False, "tensors": []}
+        assert source_from_row(row).unresolved_reason is None
+        row["unresolved_reason"] = "pending"
+        assert source_from_row(row).unresolved_reason == "pending"
+
+
+class TestWatchPending:
+    def test_keeps_polling_while_registration_is_pending_then_backs_off(self):
+        listing, client = _listing(
+            ["a"],
+            [
+                {"source_count": 1, "registration_pending": 2},
+                {"source_count": 1, "registration_pending": 1},
+                {"source_count": 1, "registration_pending": 1},
+                {"source_count": 1, "registration_pending": 0},
+            ],
+        )
+        _watch(listing, 4)
+        # a re-list on each change of the pending figure (2, 1, 0), none between
+        assert client.query_sources.call_count == 3
+
+    def test_an_older_server_without_the_field_behaves_as_before(self):
+        listing, client = _listing(["a"], [{"source_count": 1}, {"source_count": 1}])
+        _watch(listing, 2)
+        client.query_sources.assert_not_called()
