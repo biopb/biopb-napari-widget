@@ -10,7 +10,9 @@ from contextlib import contextmanager
 from typing import List, Tuple
 
 import numpy as np
-from biopb.tensor import TensorFlightClient, split_label_array_id
+from biopb.tensor import TensorFlightClient
+
+from ._labels import split_label_array_id
 
 logger = logging.getLogger(__name__)
 
@@ -411,7 +413,7 @@ def _label_binding(client, tensor_id: str, tensor_desc):
     """What a label set needs to line up with its image, or ``None``.
 
     ``None`` when *tensor_id* names no set -- the path is the only thing that
-    marks one (``biopb.tensor.split_label_array_id``). Otherwise
+    marks one (:func:`._labels.split_label_array_id`). Otherwise
     ``(label_desc, image_desc)``: the set's own descriptor and its image's.
     *image_desc* is ``None`` when the image cannot be described, which leaves
     the set a Labels layer at its own rank rather than a failure.
