@@ -137,13 +137,6 @@ class SourceList:
             self.sources = {**self.sources, resolved.source_id: resolved}
         return resolved
 
-    def warm(self, source_id: str, *, on_progress=None, should_cancel=None):
-        """Recall a multi-file source's members. Residency is not in the
-        catalog, so there is nothing to re-list."""
-        return self._client().warm(
-            source_id, on_progress=on_progress, should_cancel=should_cancel
-        )
-
     def add(self, path: str, *, cloud=False, on_progress=None, should_cancel=None):
         """Register *path*; *cloud* also registers its offline placeholders.
 
