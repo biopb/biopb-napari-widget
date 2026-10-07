@@ -793,7 +793,6 @@ class _FakeProgress:
 
     def __init__(self, *a, **k):
         self.closed = False
-        self.shown = False
         self.label = ""
         self.canceled = _Sig()  # user Cancel button -> request_cancel
 
@@ -812,9 +811,6 @@ class _FakeProgress:
 
     def exec_(self):
         pass
-
-    def show(self):  # non-modal path (warm/hydrate)
-        self.shown = True
 
 
 class TestUnresolvedHelper:
@@ -943,7 +939,7 @@ class TestResolveAction:
         w._apply_filter.assert_not_called()
 
     def test_accepted_resolves_then_repopulates(self, widget, monkeypatch):
-        # A plain (non-multifile) resolved descriptor: repopulate, no warm started.
+        # A resolved descriptor: repopulate the tree.
         w, started = self._arm(
             widget,
             monkeypatch,
@@ -1058,50 +1054,6 @@ class TestResolveAction:
             worker.finished.emit()
         assert w._resolve_workers == set()
 
-    def test_multifile_resolve_does_not_start_warm(self, widget, monkeypatch):
-        """Hydrate-ahead (biopb/biopb#202) is gated off, so a resolve that lands
-        on a multi-file source leaves the recall to the read path.
-
-        An unattended bulk recall spends the server's page cache on bytes warm
-        does not use: the chunk cache is mmap-served, so warming a >RAM source
-        evicts the segments serving every other source (biopb/biopb#1043).
-        """
-        w, started = self._arm(
-            widget,
-            monkeypatch,
-            accept=True,
-            outcome=(
-                "resolved",
-                _source("cloud_x", tensors=["cloud_x"], source_type="zarr"),
-            ),
-        )
-        w._warm_source = MagicMock()
-        w._resolve_source("cloud_x")
-        w._warm_source.assert_not_called()
-
-    def test_the_gate_is_the_only_thing_stopping_the_warm(self, widget, monkeypatch):
-        """Flipping _AUTO_WARM_AFTER_RESOLVE back on restores hydrate-ahead.
-
-        Pins that the path is gated, not dismantled: the multi-file check and the
-        call it guards are still wired, so re-enabling is the one-line flip it
-        looks like.
-        """
-        from biopb_napari_widget.tensor_browser import _widget as widget_mod
-
-        monkeypatch.setattr(widget_mod, "_AUTO_WARM_AFTER_RESOLVE", True)
-        w, started = self._arm(
-            widget,
-            monkeypatch,
-            accept=True,
-            outcome=(
-                "resolved",
-                _source("cloud_x", tensors=["cloud_x"], source_type="zarr"),
-            ),
-        )
-        w._warm_source = MagicMock()
-        w._resolve_source("cloud_x")
-        w._warm_source.assert_called_once_with("cloud_x")
-
     def test_double_click_routes_unresolved_to_resolve(self, widget, monkeypatch):
         from biopb_napari_widget.tensor_browser._widget import _TreeNode
 
@@ -1125,260 +1077,6 @@ class TestResolveAction:
 
         w._resolve_source.assert_called_once_with("cloud_x")
         w._add_to_viewer.assert_not_called()  # unresolved never hits the add path
-
-
-def _warm_progress(
-    files_done=1, files_total=3, bytes_done=10, bytes_total=30, name="c"
-):
-    from biopb.tensor.descriptor_pb2 import WarmProgress
-
-    return WarmProgress(
-        files_total=files_total,
-        files_done=files_done,
-        bytes_total=bytes_total,
-        bytes_done=bytes_done,
-        current_name=name,
-    )
-
-
-class TestMultifileHelper:
-    def test_multifile_types_detected(self):
-        from biopb_napari_widget.tensor_browser._widget import _is_multifile_source
-
-        assert _is_multifile_source(_source("z", tensors=["z"], source_type="zarr"))
-        assert _is_multifile_source(_source("o", tensors=["o"], source_type="ome-zarr"))
-        # single-file / unknown type -> no warm offer
-        assert not _is_multifile_source(
-            _source("t", tensors=["t"], source_type="ome-tiff")
-        )
-        assert not _is_multifile_source(_source("p", tensors=["p"]))
-        # unresolved (no tensors) is never "multifile" regardless of type
-        assert not _is_multifile_source(
-            _source("u", tensors=[], source_type="zarr", is_resolved=False)
-        )
-
-
-class TestHydrateAction:
-    """`_warm_source` hydrates off-thread and paints progress as an inline bar on
-    the source's tree row (biopb/biopb#202); cancel is a context-menu action."""
-
-    def _add_row(self, w, src):
-        from biopb_napari_widget.tensor_browser._widget import _TreeNode
-
-        w._tree_widget.clear()
-        w._add_tree_node(
-            w._tree_widget,
-            _TreeNode(
-                node_id="m",
-                name="m.zarr",
-                node_type="source",
-                depth=0,
-                source=src,
-            ),
-        )
-
-    def _arm(self, widget, monkeypatch, *, events):
-        from biopb_napari_widget.tensor_browser import _widget as widget_mod
-
-        w, conn, _ = widget
-        conn.client = MagicMock()
-        src = _source("m", tensors=["m"], source_type="zarr")
-        w._list.sources = {"m": src}
-        # A real tree row so the inline indicator can be read back off the item.
-        self._add_row(w, src)
-
-        made_workers = []
-
-        class _FakeWarmWorker:
-            def __init__(self, conn_, source_id):
-                self.warmed = _Sig()
-                self.failed = _Sig()
-                self.cancelled = _Sig()
-                self.progress = _Sig()
-                self.finished = _Sig()
-                self.cancel_requested = False
-                made_workers.append(self)
-
-            def request_cancel(self):
-                self.cancel_requested = True
-
-            def start(self):
-                for kind, payload in events:
-                    sig = getattr(self, kind)
-                    sig.emit(payload) if payload is not None else sig.emit()
-
-            def deleteLater(self):
-                pass
-
-        monkeypatch.setattr(widget_mod, "_WarmWorker", _FakeWarmWorker)
-        w._show_error = MagicMock()
-        w._report_failure = MagicMock()
-        return w, made_workers
-
-    def _row_fraction(self, w):
-        from biopb_napari_widget.tensor_browser._widget import _WARM_ROLE
-
-        item = w._find_source_item("m")
-        return item.data(0, _WARM_ROLE)
-
-    def test_warm_paints_indeterminate_bar_until_progress(self, widget, monkeypatch):
-        from biopb_napari_widget.tensor_browser._widget import _WARM_INDETERMINATE
-
-        w, _ = self._arm(widget, monkeypatch, events=[])  # stays in flight
-        w._warm_source("m")
-        assert "m" in w._warms
-        assert w._warms["m"].fraction == _WARM_INDETERMINATE
-        assert self._row_fraction(w) == _WARM_INDETERMINATE  # bar on the row
-        w._show_error.assert_not_called()
-
-    def test_progress_fills_bar_by_bytes(self, widget, monkeypatch):
-        # bytes_done/bytes_total drives the fraction when byte counts are known.
-        w, _ = self._arm(
-            widget,
-            monkeypatch,
-            events=[("progress", _warm_progress(bytes_done=10, bytes_total=30))],
-        )
-        w._warm_source("m")
-        assert w._warms["m"].fraction == 10 / 30
-        assert self._row_fraction(w) == 10 / 30
-
-    def test_progress_falls_back_to_files_without_bytes(self, widget, monkeypatch):
-        w, _ = self._arm(
-            widget,
-            monkeypatch,
-            events=[
-                ("progress", _warm_progress(files_done=1, files_total=4, bytes_total=0))
-            ],
-        )
-        w._warm_source("m")
-        assert w._warms["m"].fraction == 1 / 4
-
-    def test_warmed_clears_bar_and_state(self, widget, monkeypatch):
-        w, _ = self._arm(widget, monkeypatch, events=[("warmed", object())])
-        w._warm_source("m")
-        assert "m" not in w._warms
-        assert self._row_fraction(w) is None  # bar removed
-        w._show_error.assert_not_called()
-
-    def test_cancelled_clears_bar_and_state(self, widget, monkeypatch):
-        w, _ = self._arm(widget, monkeypatch, events=[("cancelled", None)])
-        w._warm_source("m")
-        assert "m" not in w._warms
-        assert self._row_fraction(w) is None
-        w._show_error.assert_not_called()
-
-    def test_failure_surfaces_inline_and_clears(self, widget, monkeypatch):
-        # Hydrate is a background op (inline bar, no modal), so its failure lands
-        # on the inline error pane -- not the modal _report_failure (#202/#206).
-        w, _ = self._arm(widget, monkeypatch, events=[("failed", "disk full")])
-        w._warm_source("m")
-        assert "m" not in w._warms
-        assert self._row_fraction(w) is None
-        w._show_error.assert_called_once()
-        assert "disk full" in w._show_error.call_args[0][0]
-        w._report_failure.assert_not_called()
-
-    def test_second_start_while_in_flight_is_noop(self, widget, monkeypatch):
-        w, workers = self._arm(widget, monkeypatch, events=[])  # stays in flight
-        w._warm_source("m")
-        w._warm_source("m")  # dedup -- no second worker
-        assert len(workers) == 1
-
-    def test_cancel_warm_requests_worker_cancel(self, widget, monkeypatch):
-        w, workers = self._arm(widget, monkeypatch, events=[])
-        w._warm_source("m")
-        assert workers and not workers[0].cancel_requested
-        w._cancel_warm("m")
-        assert workers[0].cancel_requested
-
-    def test_worker_gc_retained_until_finished(self, widget, monkeypatch):
-        # _warms drops the worker on `warmed` (so the menu flips back to
-        # "Hydrate"), but the QThread must stay GC-anchored in _warm_retain until
-        # `finished` fires, else a backend that doesn't keep the wrapper alive
-        # could destroy a still-running thread (#202 review).
-        w, workers = self._arm(widget, monkeypatch, events=[("warmed", object())])
-        w._warm_source("m")
-        assert "m" not in w._warms  # UI state already dropped
-        assert workers[0] in w._warm_retain  # ...but GC ref still held
-        workers[0].finished.emit()  # released only on finished
-        assert workers[0] not in w._warm_retain
-
-    def test_indicator_survives_tree_rebuild(self, widget, monkeypatch):
-        # Every refresh/filter clear()s and rebuilds the tree, dropping the
-        # per-item role; _reapply_warm_indicators paints the bar back (#202).
-        w, _ = self._arm(
-            widget,
-            monkeypatch,
-            events=[("progress", _warm_progress(bytes_done=10, bytes_total=40))],
-        )
-        w._warm_source("m")
-        assert self._row_fraction(w) == 10 / 40
-        self._add_row(w, w._sources["m"])  # simulate the clear/rebuild
-        assert self._row_fraction(w) is None  # role gone after rebuild
-        w._reapply_warm_indicators()
-        assert self._row_fraction(w) == 10 / 40  # bar repainted
-
-    def _menu_labels(self, w, monkeypatch):
-        """Drive `_show_context_menu` over the 'm' row with a recording menu;
-        return ``{label: action}`` (the action's ``trigger()`` fires its slot)."""
-        from qtpy.QtCore import QPoint
-
-        from biopb_napari_widget.tensor_browser import _widget as widget_mod
-
-        recorded = {}
-
-        class _RecAction:
-            def __init__(self, text):
-                self.text = text
-                self.triggered = self
-                self._slot = None
-
-            def connect(self, cb):
-                self._slot = cb
-
-            def trigger(self):
-                self._slot()
-
-            def setEnabled(self, *_):
-                pass
-
-        class _RecMenu:
-            def __init__(self, *a):
-                pass
-
-            def addAction(self, text):
-                act = _RecAction(text)
-                recorded[text] = act
-                return act
-
-            def addSeparator(self):
-                pass
-
-            def exec_(self, *a):
-                pass
-
-        monkeypatch.setattr(widget_mod, "QMenu", _RecMenu)
-        item = w._find_source_item("m")
-        w._tree_widget.itemAt = MagicMock(return_value=item)
-        w._tree_widget.mapToGlobal = MagicMock(return_value=QPoint(0, 0))
-        w._show_context_menu(QPoint(0, 0))
-        return recorded
-
-    def test_context_menu_offers_hydrate_when_idle(self, widget, monkeypatch):
-        w, _ = self._arm(widget, monkeypatch, events=[("warmed", object())])
-        w._warm_source("m")  # completes -> not warming
-        labels = self._menu_labels(w, monkeypatch)
-        assert "Hydrate all files…" in labels
-        assert "Cancel hydration" not in labels
-
-    def test_context_menu_offers_cancel_while_warming(self, widget, monkeypatch):
-        w, workers = self._arm(widget, monkeypatch, events=[])  # in flight
-        w._warm_source("m")
-        labels = self._menu_labels(w, monkeypatch)
-        assert "Cancel hydration" in labels
-        assert "Hydrate all files…" not in labels
-        labels["Cancel hydration"].trigger()  # the action cancels the warm
-        assert workers[0].cancel_requested
 
 
 class TestAddToViewer:

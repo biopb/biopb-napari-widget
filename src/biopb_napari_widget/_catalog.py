@@ -6,7 +6,7 @@ The SDK hands back rows and deliberately picks no structure for them
 into is the caller's job. This module is that choice, made once for this package.
 
 Attributes rather than dict keys because the consumer is a Qt widget: the tree
-builder, the residency badge and the resolve/warm branches read these fields
+builder, the residency badge and the resolve branches read these fields
 across a few hundred lines, and ``src.source_url`` survives a typo where
 ``src["source_url"]`` does not. Frozen because the widget's ``SourceList``
 is rebound wholesale from a watcher thread and read on the Qt main thread -- the

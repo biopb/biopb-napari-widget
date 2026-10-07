@@ -13,13 +13,11 @@ import logging
 import os
 import re
 import threading
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, NamedTuple, Sequence, Set
 from urllib.parse import urlparse
 
 from biopb.tensor import Connection, ResolveCancelled
-from qtpy.QtCore import QRect, Qt, QThread, QTimer, Signal
-from qtpy.QtGui import QColor
+from qtpy.QtCore import Qt, QThread, QTimer, Signal
 from qtpy.QtWidgets import (
     QApplication,
     QDialog,
@@ -32,7 +30,6 @@ from qtpy.QtWidgets import (
     QProgressDialog,
     QPushButton,
     QSizePolicy,
-    QStyledItemDelegate,
     QTextEdit,
     QTreeWidget,
     QTreeWidgetItem,
@@ -303,130 +300,6 @@ class _ResolveWorker(QThread):
         self.resolved.emit(descriptor)
 
 
-# Source types whose data lives across many files under one directory (the
-# dir-claimed formats). Only these benefit from hydrate-ahead; a single-file
-# source's bytes were already recalled by resolve, so warm is a server-side
-# no-op there and we don't bother offering it.
-_MULTIFILE_SOURCE_TYPES = frozenset(
-    {
-        "zarr",
-        "ome-zarr",
-        "ome-zarr-hcs",
-        "ndtiff",
-        "tiff-sequence",
-        "micromanager-legacy",
-    }
-)
-
-
-def _is_multifile_source(src: CatalogSource) -> bool:
-    """A resolved, directory-backed multi-file source -- the case where member
-    data files recall lazily onto the read path, so hydrate-ahead helps."""
-    return not _is_unresolved(src) and src.source_type in _MULTIFILE_SOURCE_TYPES
-
-
-# Item-data role carrying a hydrate-ahead ("warm") progress fraction on a source
-# row: 0..1 = determinate, ``_WARM_INDETERMINATE`` = counts not known yet,
-# absent/None = not warming. ``_WarmProgressDelegate`` paints a translucent fill
-# across the row to that fraction instead of floating a progress dialog
-# (biopb/biopb#202); cancel is offered from the context menu.
-_WARM_ROLE = Qt.ItemDataRole.UserRole + 10
-_WARM_INDETERMINATE = -1.0
-# Translucent accent painted behind a hydrating row; the row's normal text and
-# shape badge render on top unchanged.
-_WARM_FILL = QColor(64, 132, 223, 60)
-
-# Hydrate-ahead after a resolve, off. The chunk cache serves its segments by
-# mmap, so warming a source larger than RAM walks the whole page-cache LRU and
-# evicts the segments serving every *other* source -- for bytes warm never even
-# uses, since the read only exists to make the sync client write to disk. It
-# does not keep its own coarse levels either, and nothing portable would: there
-# is no `posix_fadvise` on Windows, which is where the synced-folder sources
-# this serves live (biopb/biopb#1043). Flip back once warm has a retention
-# policy. The context menu's "Hydrate all files…" is unaffected -- named,
-# visible, cancellable, and bounded by a user watching it.
-_AUTO_WARM_AFTER_RESOLVE = False
-
-
-class _WarmProgressDelegate(QStyledItemDelegate):
-    """Paints a hydrate-ahead progress fill behind a source row.
-
-    The fraction lives on the item at :data:`_WARM_ROLE`; a row without it renders
-    normally. A determinate fraction (0..1) fills the left portion of the row; the
-    indeterminate sentinel tints the whole row faintly until the first server
-    count arrives. The fill is drawn *under* the default item paint so the
-    existing name / shape badge stay legible -- the bar is the only progress
-    affordance (no percentage text). biopb/biopb#202.
-    """
-
-    def paint(self, painter, option, index):
-        fraction = index.data(_WARM_ROLE)
-        if fraction is not None:
-            rect = QRect(option.rect)
-            if fraction >= 0:
-                rect.setWidth(int(rect.width() * max(0.0, min(1.0, fraction))))
-            painter.fillRect(rect, _WARM_FILL)
-        super().paint(painter, option, index)
-
-
-class _WarmWorker(QThread):
-    """Runs the blocking ``SourceList.warm`` off the GUI thread.
-
-    Warming asks the server to recall all of a resolved source's member files
-    (server-side; no pixels cross the wire), which can take minutes, so it must
-    not run on the Qt event loop. Unlike resolve, warm is presented *non-modally*
-    -- the user keeps browsing while it runs. Server progress (files/bytes) is
-    relayed via :attr:`progress`; :meth:`request_cancel` cooperatively stops it
-    (the client closes the stream, the server halts the recall).
-    """
-
-    warmed = Signal(object)  # terminal WarmProgress
-    failed = Signal(str)
-    cancelled = Signal()
-    progress = Signal(object)  # WarmProgress
-
-    def __init__(self, sources: SourceList, source_id: str):
-        super().__init__()
-        self._sources = sources
-        self._source_id = source_id
-        self._cancel = threading.Event()
-
-    def request_cancel(self):
-        """Ask the running warm to stop (thread-safe, idempotent)."""
-        self._cancel.set()
-
-    def run(self):
-        try:
-            done = self._sources.warm(
-                self._source_id,
-                on_progress=self.progress.emit,
-                should_cancel=self._cancel.is_set,
-            )
-        except ResolveCancelled:
-            self.cancelled.emit()
-            return
-        except Exception as exc:  # surface the SDK/server message to the user
-            self.failed.emit(str(exc))
-            return
-        self.warmed.emit(done)
-
-
-@dataclass
-class _WarmState:
-    """In-flight hydrate-ahead warm for one source (UI state).
-
-    Holds the :class:`_WarmWorker` reference used to cancel from the context menu
-    and the last progress ``fraction`` (``None`` = indeterminate); the fraction is
-    kept here, not only on the tree item, so the inline bar can be re-applied after
-    the tree is cleared and rebuilt. GC ownership of the QThread lives separately
-    in ``_warm_retain`` (held until ``finished``), because this state is dropped
-    earlier -- on ``warmed``/``cancelled``/``failed`` -- to flip the menu back.
-    """
-
-    worker: _WarmWorker
-    fraction: float | None = None
-
-
 # A dropped folder with more than this many filesystem entries prompts a
 # confirmation before the recursive scan is sent (a footgun-stopper for dropping
 # a home/root folder by mistake). Counted client-side: drag-drop is gated to a
@@ -500,7 +373,7 @@ class _AddSourceWorker(QThread):
 
     Registering a dropped file/dir asks the server to discover + catalog it,
     which for a plain folder is a slow recursive walk that may add many sources,
-    so it must not run on the Qt event loop. Presented *non-modally* (like warm):
+    so it must not run on the Qt event loop. Presented *non-modally*:
     the user keeps using the viewer while sources appear. Per-source progress is
     relayed via :attr:`progress`; :meth:`request_cancel` cooperatively stops the
     walk (the client closes the stream; sources already registered stay).
@@ -1020,21 +893,8 @@ class TensorBrowserWidget(QWidget):
         # clobber each other's only ref and get the QThread GC'd / destroyed while
         # still running -- important once a non-modal progress/cancel lets two run.
         self._resolve_workers: set = set()
-        # In-flight hydrate-ahead warms, keyed by source_id -> _WarmState. This map
-        # is *UI state* -- it answers "is this source warming?" for the context
-        # menu / dedup and carries the row progress fraction so a rebuild can
-        # re-apply the inline bar. It is popped on warmed/cancelled/failed (which
-        # all fire *before* `finished`) so the menu flips back to "Hydrate"
-        # promptly; it is therefore NOT the GC owner of the QThread.
-        self._warms: Dict[str, _WarmState] = {}
-        # GC ownership of warm QThreads, separate from `_warms` and held all the
-        # way to `finished` (like `_resolve_workers`). `_warms` drops the worker
-        # too early to anchor it through the warmed->finished window, so a strong
-        # Python ref must live here or a backend that doesn't keep the wrapper
-        # alive could GC/destroy the QThread while it is still running.
-        self._warm_retain: set = set()
         # In-flight drag-drop add worker (at most one at a time) plus GC retention
-        # to the ``finished`` signal, mirroring the resolve/warm ownership rule.
+        # to the ``finished`` signal, mirroring the resolve ownership rule.
         self._add_worker: _AddSourceWorker | None = None
         self._add_retain: set = set()
         # Dropped paths whose last add left offline files out. The name check
@@ -1188,9 +1048,6 @@ class TensorBrowserWidget(QWidget):
         self._tree_widget.itemClicked.connect(self._on_tree_item_clicked)
         self._tree_widget.itemDoubleClicked.connect(self._on_tree_item_double_clicked)
         self._tree_widget.setStyleSheet("QTreeWidget { min-height: 300px; }")
-        # Paints the inline hydrate-ahead progress fill behind a source row
-        # (biopb/biopb#202) -- replaces the old floating progress dialog.
-        self._tree_widget.setItemDelegate(_WarmProgressDelegate(self._tree_widget))
         layout.addWidget(self._tree_widget, stretch=1)
 
         # Drag-drop affordance row: an always-visible hint reflecting whether a
@@ -1453,7 +1310,7 @@ class TensorBrowserWidget(QWidget):
             self._clear_message()
 
     def _report_failure(self, title: str, message: str):
-        """Modally report a failed *user-initiated* action (resolve/hydrate/load).
+        """Modally report a failed *user-initiated* action (resolve/load).
 
         These actions are explicit, consenting gestures the user actively
         triggered and watched (a modal progress dialog, or a busy cursor during
@@ -1846,10 +1703,6 @@ class TensorBrowserWidget(QWidget):
         # filter/refresh, which drops Qt's current-item even though we still track
         # the logical selection (issue #191).
         self._restore_selection()
-        # Re-apply inline hydrate-ahead progress bars: clear() above dropped the
-        # per-item _WARM_ROLE, so an in-flight warm's bar must be painted back onto
-        # the freshly built row (biopb/biopb#202).
-        self._reapply_warm_indicators()
 
     def _add_tree_node(self, parent, node: _TreeNode):
         """Add a tree node to the widget."""
@@ -1889,11 +1742,8 @@ class TensorBrowserWidget(QWidget):
             else:
                 display_name = f"{node.name}{_unresolved_badge(src)}"
 
-            # No residency indicator. Drawing one cost a live stat walk per
-            # source on every browse, and it was painted from a listing
-            # snapshot that never refreshed -- so it went stale exactly after a
-            # warm, the one action that changes residency, offered from this
-            # widget's own context menu (biopb/biopb#1048).
+            # No residency indicator: drawing one cost a live stat walk per
+            # source on every browse (biopb/biopb#1048).
             item.setText(0, display_name)
             # The horizontal scrollbar is pinned off (biopb/biopb#367), so the
             # full label -- which elides when it outgrows the panel -- is only
@@ -2184,18 +2034,6 @@ class TensorBrowserWidget(QWidget):
             else:
                 view_action.setEnabled(False)
 
-        # Hydrate-ahead: while a warm is in flight on this source, offer to cancel
-        # it (the inline row bar is the only other affordance); otherwise offer to
-        # (re)start it on any resolved multi-file source. Harmless to re-run
-        # (idempotent); a single-file source is excluded (warm is a no-op there).
-        menu_src = self._sources.get(source_id)
-        if source_id in self._warms:
-            cancel_action = menu.addAction("Cancel hydration")
-            cancel_action.triggered.connect(lambda: self._cancel_warm(source_id))
-        elif menu_src is not None and _is_multifile_source(menu_src):
-            warm_action = menu.addAction("Hydrate all files…")
-            warm_action.triggered.connect(lambda: self._warm_source(source_id))
-
         # Metadata action
         meta_action = menu.addAction("Metadata")
         meta_action.triggered.connect(
@@ -2268,7 +2106,7 @@ class TensorBrowserWidget(QWidget):
                 label += f" ({_human_bytes(p.target_bytes)})"
             progress.setLabelText(label)
 
-        def _on_resolved(descriptor):
+        def _on_resolved(_descriptor):
             progress.close()
             # Pin the just-resolved source as the logical selection so the rebuild
             # below re-highlights it and scrolls it into view -- otherwise the user
@@ -2282,17 +2120,6 @@ class TensorBrowserWidget(QWidget):
             # through _apply_filter so any active search text is preserved and the
             # resolved source now shows its shape badge / field children.
             self._apply_filter()
-            # A multi-file source's member data files are still dehydrated and
-            # recall lazily (and slowly) onto the read path. Hydrating ahead for
-            # the user here (biopb/biopb#202) is gated off -- see
-            # _AUTO_WARM_AFTER_RESOLVE -- so asking for it is the context menu's
-            # "Hydrate all files…" now.
-            if (
-                _AUTO_WARM_AFTER_RESOLVE
-                and descriptor is not None
-                and _is_multifile_source(descriptor)
-            ):
-                self._warm_source(source_id)
 
         def _on_failed(message):
             progress.close()
@@ -2321,126 +2148,6 @@ class TensorBrowserWidget(QWidget):
         # slot above calls progress.close(). The worker's queued signal is
         # delivered inside this exec_, so a fast finish can't deadlock.
         progress.exec_()
-
-    def _find_source_item(self, source_id: str) -> QTreeWidgetItem | None:
-        """Return the ``"source"`` tree item for ``source_id`` (or None).
-
-        Walks the freshly built tree the same way :meth:`_restore_selection`
-        does; used to paint/clear a row's inline hydrate-ahead progress bar.
-        """
-        found: QTreeWidgetItem | None = None
-
-        def walk(item: QTreeWidgetItem):
-            nonlocal found
-            if found is not None:
-                return
-            if (
-                item.data(0, Qt.ItemDataRole.UserRole + 1) == "source"
-                and item.data(0, Qt.ItemDataRole.UserRole) == source_id
-            ):
-                found = item
-                return
-            for i in range(item.childCount()):
-                walk(item.child(i))
-
-        for i in range(self._tree_widget.topLevelItemCount()):
-            walk(self._tree_widget.topLevelItem(i))
-        return found
-
-    def _set_warm_indicator(self, source_id: str, fraction: float | None):
-        """Set (or clear) the inline hydrate-ahead progress bar for a source.
-
-        Records ``fraction`` on the live :class:`_WarmState` (so a tree rebuild
-        can re-apply it) and writes it onto the source's tree item at
-        :data:`_WARM_ROLE`, which repaints just that row via the delegate.
-        ``fraction is None`` removes the bar. Safe if the row isn't currently
-        materialized (e.g. filtered out) -- the state still carries the value.
-        """
-        state = self._warms.get(source_id)
-        if state is not None:
-            state.fraction = fraction
-        item = self._find_source_item(source_id)
-        if item is not None:
-            item.setData(0, _WARM_ROLE, fraction)
-
-    def _reapply_warm_indicators(self):
-        """Repaint every in-flight warm's bar after a tree clear/rebuild."""
-        for source_id, state in self._warms.items():
-            item = self._find_source_item(source_id)
-            if item is not None:
-                item.setData(0, _WARM_ROLE, state.fraction)
-
-    def _cancel_warm(self, source_id: str):
-        """Cancel an in-flight hydrate-ahead warm (from the context menu).
-
-        Cooperative: the worker closes the stream and the server stops the
-        recall; the ``cancelled`` signal then clears the inline bar.
-        """
-        state = self._warms.get(source_id)
-        if state is not None:
-            state.worker.request_cancel()
-
-    def _warm_source(self, source_id: str):
-        """Hydrate-ahead a resolved multi-file source's member files.
-
-        Runs the blocking warm in a background worker (the user keeps
-        browsing/viewing while the server recalls files) and surfaces progress as
-        an *inline bar painted across the source's tree row* rather than a
-        floating dialog (biopb/biopb#202). Cancel is offered from the context
-        menu (:meth:`_cancel_warm`). Idempotent: re-triggering while a warm is
-        already in flight is a no-op, and re-triggering after a cancel just
-        finishes the remainder; several sources can warm at once.
-
-        A source whose member files were already recalled by resolve (e.g. a TIFF
-        sequence, whose construction opens every file) warms to a near-instant
-        server no-op -- the bar flicks on and off too fast to notice -- while a
-        slow cloud chunk recall (zarr / ome-zarr) fills the row as it progresses.
-        """
-        src = self._sources.get(source_id)
-        if not src or not self._connected:
-            return
-        if source_id in self._warms:  # already hydrating -- don't double-start
-            return
-
-        self._clear_error()
-
-        worker = _WarmWorker(self._list, source_id)
-        self._warms[source_id] = _WarmState(worker=worker)  # UI state
-        self._warm_retain.add(worker)  # GC owner, held until `finished`
-        # Indeterminate until the first server count arrives.
-        self._set_warm_indicator(source_id, _WARM_INDETERMINATE)
-
-        def _on_progress(p):
-            if p.bytes_total:
-                fraction = p.bytes_done / p.bytes_total
-            elif p.files_total:
-                fraction = p.files_done / p.files_total
-            else:
-                fraction = _WARM_INDETERMINATE
-            self._set_warm_indicator(source_id, fraction)
-
-        def _finish():
-            self._warms.pop(source_id, None)
-            self._set_warm_indicator(source_id, None)  # remove the bar
-
-        def _on_failed(message):
-            # Hydrate is a background, unintrusive operation (inline row bar, no
-            # modal progress), so its failure stays on the inline error pane to
-            # match -- unlike the explicit, modal resolve/load paths which report
-            # via _report_failure (biopb/biopb#206).
-            _finish()
-            self._show_error(f"Hydrate failed: {message}")
-
-        worker.progress.connect(_on_progress)
-        worker.warmed.connect(lambda _done: _finish())
-        worker.cancelled.connect(_finish)
-        worker.failed.connect(_on_failed)
-        # Release the GC ref and schedule C++ deletion only once the thread has
-        # actually finished -- _finish() above drops the earlier `_warms` entry,
-        # so `_warm_retain` is what keeps the QThread alive in between.
-        worker.finished.connect(lambda: self._warm_retain.discard(worker))
-        worker.finished.connect(worker.deleteLater)
-        worker.start()
 
     def _view_tensor(self, source_id: str, tensor_id: str):
         """Add single tensor to viewer."""

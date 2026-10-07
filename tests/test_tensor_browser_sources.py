@@ -124,11 +124,6 @@ class TestVerbs:
         client.resolve.return_value = _rows(["a"])[0]
         assert listing.resolve("a").source_id == "a"
 
-    def test_warm_does_not_relist(self):
-        listing, client = _listing(["a"])
-        listing.warm("a")
-        client.query_sources.assert_not_called()
-
     def test_use_server_query_follows_the_size(self):
         listing, _ = _listing([str(i) for i in range(1001)])
         assert listing.use_server_query
