@@ -22,7 +22,7 @@ classifiers = [
 requires-python = ">=3.10,<3.14"
 # napari itself is the host and is not declared, as usual for a plugin.
 dependencies = [
-    # biopb.is_local_url, biopb.image's serialization helpers and biopb.tensor.Connection.
+    # biopb.image's serialization helpers and biopb.tensor.Connection.
     "biopb[tensor] >= 0.12.0rc1",
     "numpy",
     "pandas",

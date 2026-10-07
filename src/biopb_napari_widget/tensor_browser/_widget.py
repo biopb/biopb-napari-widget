@@ -17,7 +17,6 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, NamedTuple, Sequence, Set
 from urllib.parse import urlparse
 
-from biopb import is_local_url
 from biopb.tensor import Connection, ResolveCancelled
 from qtpy.QtCore import QRect, Qt, QThread, QTimer, Signal
 from qtpy.QtGui import QColor
@@ -44,6 +43,7 @@ from qtpy.QtWidgets import (
 from .._catalog import CatalogSource
 from .._labels import split_label_array_id
 from .._tensor_utils import add_tensor_layer
+from .._urls import is_local_url
 from ._sources import SourceList
 
 if TYPE_CHECKING:
