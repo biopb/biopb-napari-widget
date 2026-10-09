@@ -123,7 +123,7 @@ def canonical_dim_labels(tensor_desc) -> List[str] | None:
     layer array *is* the source array: the server guarantees the order and the
     client no longer changes the rank, so the source's names describe the
     layer's axes one for one. Lowercased because that is the NGFF axis-name
-    convention this feeds (``_writers._axis_dict``).
+    convention.
 
     The length matches the array's rank, not napari's ``layer.ndim``: an
     interleaved samples axis is a real array axis (napari just doesn't count it),
@@ -149,7 +149,7 @@ def _apply_axis_labels(viewer, layer, dim_labels: List[str] | None) -> None:
     - *dim_labels* names every axis of the source array, one entry longer than
       ``layer.ndim`` when napari folds a trailing interleaved-colour axis into
       an ``rgb`` layer instead of slicing it (the same gap
-      :func:`canonical_dim_labels` notes for the OME-Zarr writer) -- trimmed
+      :func:`canonical_dim_labels` notes) -- trimmed
       to ``layer.ndim`` first.
     - napari's dims are viewer-global, not per layer, and broadcast a shorter
       layer's axes onto the *trailing* ``layer.ndim`` of ``viewer.dims.ndim``,
@@ -267,7 +267,7 @@ def build_pyramid_levels(
     That used to happen so ``build_layer_scale`` could write physical sizes to
     fixed trailing slots, but it made every layer disagree in rank with its
     source -- so ``layer.ndim`` had to be reasoned about separately from the
-    descriptor, a 2-D image round-tripped through the OME-Zarr writer gained a
+    descriptor, a 2-D image gained a
     phantom Z, and the agent guide needed a trap for the offset. The scale is
     placed by axis index instead, and the layer is now exactly the source array.
 
@@ -661,10 +661,8 @@ def add_tensor_layer(
     metadata = {"array_id": tensor_id}
     if phys is not None:
         metadata["ome_physical_size"] = phys
-    # Name the layer's axes for the OME-Zarr writer (biopb/biopb#651): it is
-    # handed only napari's (path, data, meta), so with no labels there it falls
-    # back to a positional guess that mislabels every leading pair that isn't
-    # (C, T) -- writing a TCZYX source with T and C swapped.
+    # Name the layer's axes, so a consumer handed only the layer (not the
+    # descriptor) need not guess them positionally.
     labels = canonical_dim_labels(tensor_desc)
     if labels:
         metadata["dim_labels"] = labels

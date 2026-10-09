@@ -1,7 +1,7 @@
 [project]
 name = "biopb-napari-widget"
 dynamic = ["version"]
-description = "napari widgets for biopb: the Tensor Browser and OME-Zarr writers"
+description = "napari widgets for biopb: the Tensor Browser"
 readme = "README.md"
 license = {file = "LICENSE"}
 authors = [{name = "Ji Yu", email = "jyu@uchc.edu"}]
@@ -23,14 +23,12 @@ requires-python = ">=3.10,<3.14"
 # napari itself is the host and is not declared, as usual for a plugin.
 dependencies = [
     # biopb.image's serialization helpers and biopb.tensor.Connection.
-    "biopb[tensor] >= 0.12.0rc1",
+    "biopb[tensor] >= 0.12.0rc2",
     "numpy",
     "pandas",
     "dask",
     "magicgui",
     "qtpy",
-    "ome-zarr >= 0.6.1",
-    "zarr",
     "opencv-python-headless",
     # grpc_health.v1, for the image-processing widgets' server check.
     "grpcio-health-checking",
