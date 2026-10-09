@@ -47,9 +47,9 @@ def _sources_sql(client) -> str:
     return f"SELECT {columns} FROM sources ORDER BY source_id"
 
 
-def _accepts_cloud(add_source) -> bool:
+def _accepts_cloud(register) -> bool:
     try:
-        params = inspect.signature(add_source).parameters
+        params = inspect.signature(register).parameters
     except (TypeError, ValueError):
         return True  # cannot tell; let the SDK answer
     return "cloud" in params or any(
@@ -88,7 +88,7 @@ class SourceList:
     def refresh(self) -> Dict[str, CatalogSource]:
         """Re-list the whole catalog from the server."""
         client = self._client()
-        rows = client.query_sources(_sources_sql(client), format="records")
+        rows = client.query(_sources_sql(client), format="records")
         self.sources = {s.source_id: s for s in sources_from_rows(rows)}
         return self.sources
 
@@ -122,7 +122,7 @@ class SourceList:
 
     def resolve(self, source_id: str, *, on_progress=None, should_cancel=None):
         """Resolve a cloud source (downloads it; call off the GUI thread)."""
-        row = self._client().resolve(
+        row = self._client().resolve_source(
             source_id, on_progress=on_progress, should_cancel=should_cancel
         )
         self.refresh()
@@ -140,25 +140,27 @@ class SourceList:
     def add(self, path: str, *, cloud=False, on_progress=None, should_cancel=None):
         """Register *path*; *cloud* also registers its offline placeholders.
 
-        ``cloud`` is only sent when set, and only to an SDK whose ``add_source``
+        ``cloud`` is only sent when set, and only to an SDK whose ``register_local_path``
         takes it: against an older one the drop proceeds without it, as it did
         before the keyword existed, rather than failing on an unknown argument.
         """
         client = self._client()
         kwargs = {}
         if cloud:
-            if _accepts_cloud(client.add_source):
+            if _accepts_cloud(client.register_local_path):
                 kwargs["cloud"] = True
             else:
-                logger.warning("SDK add_source has no `cloud`; adding without it")
-        result = client.add_source(
+                logger.warning(
+                    "SDK register_local_path has no `cloud`; adding without it"
+                )
+        result = client.register_local_path(
             path, on_progress=on_progress, should_cancel=should_cancel, **kwargs
         )
         self.refresh()
         return result
 
     def remove(self, root_url: str):
-        result = self._client().remove_source(root_url)
+        result = self._client().deregister_local_path(root_url)
         self.refresh()
         return result
 

@@ -73,7 +73,7 @@ class _TreeNode:
         self.children: List[_TreeNode] = []
         # Set on the top-level node of a drag-dropped (``dnd://``) branch: the
         # tree shows a remove [x] on it, and ``remove_root`` is the ``dnd://``
-        # prefix passed to ``remove_source`` to deregister the whole branch.
+        # prefix passed to ``deregister_local_path`` to deregister the whole branch.
         self.dropped: bool = False
         self.remove_root: str | None = None
 
@@ -378,7 +378,7 @@ class _AddSourceWorker(QThread):
     relayed via :attr:`progress`; :meth:`request_cancel` cooperatively stops the
     walk (the client closes the stream; sources already registered stay).
 
-    One drop == one path == one ``add_source`` call == one terminal result
+    One drop == one path == one ``register_local_path`` call == one terminal result
     ``(added, refreshed, removed, failed)``. Multi-item drops are refused upstream
     (``_local_paths_from_mime``), so there is no cross-path aggregation here — a
     single call keeps the progress count monotone. An oversized folder is caught
@@ -434,7 +434,7 @@ class _RemoveSourceWorker(QThread):
 
     Removal is quick server-side (unregister N adapters), but a rescan may briefly
     hold the catalog lock, so it runs off the Qt event loop like the add worker.
-    One [x] click == one ``remove_source`` call == one terminal ``(removed,
+    One [x] click == one ``deregister_local_path`` call == one terminal ``(removed,
     failed)`` tally. Only drag-dropped (``dnd://``) branches are ever removable, so
     there is nothing to cancel and no path aggregation.
     """
@@ -476,7 +476,7 @@ def _build_tree(sources: Dict[str, CatalogSource]) -> _TreeNode:
         parts = _get_path_parts(src.source_url)
         # A drag-dropped (dnd://) source's top-level node is a removable branch
         # root; tag it so the tree shows a remove [x], and record the dnd:// prefix
-        # that remove_source() targets (all of one drop's sources share it).
+        # that deregister_local_path() targets (all of one drop's sources share it).
         is_dropped = src.source_url.startswith(_DND_URL_PREFIX)
         remove_root = (_DND_URL_PREFIX + parts[0]) if (is_dropped and parts) else None
         if not parts:
@@ -1572,7 +1572,7 @@ class TensorBrowserWidget(QWidget):
             try:
                 self._refresh()
             except Exception:
-                logger.exception("refresh after add_source failed")
+                logger.exception("refresh after register_local_path failed")
 
         parts = []
         if added:
@@ -1829,7 +1829,7 @@ class TensorBrowserWidget(QWidget):
             try:
                 self._refresh()
             except Exception:
-                logger.exception("refresh after remove_source failed")
+                logger.exception("refresh after deregister_local_path failed")
         n = len(removed)
         self._show_status(
             f"Removed {n} source{'' if n == 1 else 's'}" if n else "Nothing to remove"
@@ -2294,8 +2294,8 @@ class TensorBrowserWidget(QWidget):
                 f"LOWER(source_url) LIKE '%{escaped}%' OR "
                 f"LOWER(source_type) LIKE '%{escaped}%'"
             )
-            table = self._client.query_sources(sql)
-            ids = {row["source_id"].as_py() for row in table.to_batches()}
+            rows = self._client.query(sql, format="records")
+            ids = {row["source_id"] for row in rows}
             self._build_and_display_tree(filtered_ids=ids)
         except Exception:
             logger.exception("Server filter failed")
