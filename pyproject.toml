@@ -1,7 +1,7 @@
 [project]
 name = "biopb-napari-widget"
 dynamic = ["version"]
-description = "napari widgets for biopb: the Tensor Browser and OME-Zarr writers"
+description = "napari widgets for biopb: the Tensor Browser"
 readme = "README.md"
 license = {file = "LICENSE"}
 authors = [{name = "Ji Yu", email = "jyu@uchc.edu"}]
@@ -29,8 +29,6 @@ dependencies = [
     "dask",
     "magicgui",
     "qtpy",
-    "ome-zarr >= 0.6.1",
-    "zarr",
     "opencv-python-headless",
     # grpc_health.v1, for the image-processing widgets' server check.
     "grpcio-health-checking",
