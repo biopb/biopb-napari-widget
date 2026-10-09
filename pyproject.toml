@@ -23,7 +23,7 @@ requires-python = ">=3.10,<3.14"
 # napari itself is the host and is not declared, as usual for a plugin.
 dependencies = [
     # biopb.image's serialization helpers and biopb.tensor.Connection.
-    "biopb[tensor] >= 0.12.0rc1",
+    "biopb[tensor] >= 0.12.0rc2",
     "numpy",
     "pandas",
     "dask",
