@@ -1560,6 +1560,57 @@ class TestRoiAnnotations:
         assert any("@ome" in t and "read-only" in t for t in texts)
         assert any("nuclei" in t and "read-only" not in t for t in texts)
 
+    def _context_menu_texts(self, w, monkeypatch, roi_sets):
+        """The texts of the real right-click menu on the source's row."""
+        from qtpy.QtCore import QPoint
+        from qtpy.QtWidgets import QMenu
+
+        from biopb_napari_widget.tensor_browser._widget import TensorBrowserWidget
+
+        w._list.sources = {"a": _source("a", tensors=["a"])}
+        w._list.roi_sets = roi_sets
+        w._build_and_display_tree = lambda **kw: (
+            TensorBrowserWidget._build_and_display_tree(w, **kw)
+        )
+        w._build_and_display_tree()
+        item = w._tree_widget.topLevelItem(0)
+        while item.childCount():  # down to the source row
+            item = item.child(0)
+        seen = []
+
+        def _exec(menu, *a):
+            def walk(m):
+                for act in m.actions():
+                    seen.append(act.text())
+                    if act.menu():
+                        walk(act.menu())
+
+            walk(menu)
+
+        monkeypatch.setattr(w._tree_widget, "itemAt", lambda pos: item)
+        monkeypatch.setattr(QMenu, "exec_", _exec)
+        w._show_context_menu(QPoint(0, 0))
+        return seen
+
+    def test_the_real_menu_has_no_roi_entry_when_the_array_carried_no_roi(
+        self, widget, monkeypatch
+    ):
+        w, _, _ = widget
+        for roi_sets in (
+            {},  # server supports it, nothing annotated
+            {"other": {"s": 1}},  # some other array has sets, this one none
+            {"a": {}},  # an entry with no sets
+            None,  # server cannot say
+        ):
+            texts = self._context_menu_texts(w, monkeypatch, roi_sets)
+            assert texts, "the menu itself must still be built"
+            assert not any("ROI" in t for t in texts), (roi_sets, texts)
+
+    def test_the_real_menu_has_the_roi_entry_when_it_did(self, widget, monkeypatch):
+        w, _, _ = widget
+        texts = self._context_menu_texts(w, monkeypatch, {"a": {"nuclei": 4}})
+        assert any("ROI" in t and "nuclei" in t for t in texts), texts
+
     def test_picking_a_set_fetches_that_set(self, widget, monkeypatch):
         from biopb_napari_widget.tensor_browser import _widget as widget_mod
 
