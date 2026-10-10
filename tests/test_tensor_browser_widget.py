@@ -1346,3 +1346,175 @@ class TestSoleImage:
 
     def test_no_tensors(self):
         assert self._sole() is None
+
+
+class TestSearch:
+    """Search on a large catalog follows biopb's web viewer: the query runs off the
+    GUI thread, is capped, drops superseded answers, and says what it did."""
+
+    def _real_tree(self, w, sources):
+        from biopb_napari_widget.tensor_browser._widget import TensorBrowserWidget
+
+        w._list.sources = sources
+        w._build_and_display_tree = lambda **kw: (
+            TensorBrowserWidget._build_and_display_tree(w, **kw)
+        )
+
+    def _rows(self, w):
+        tree = w._tree_widget
+        out = []
+
+        def walk(item):
+            out.append(item.text(0))
+            for i in range(item.childCount()):
+                walk(item.child(i))
+
+        for i in range(tree.topLevelItemCount()):
+            walk(tree.topLevelItem(i))
+        return out
+
+    def test_sql_is_capped_ordered_and_escaped(self):
+        from biopb_napari_widget.tensor_browser._widget import (
+            SERVER_QUERY_LIMIT,
+            _search_sql,
+        )
+
+        sql = _search_sql("it's_50%")
+        assert f"LIMIT {SERVER_QUERY_LIMIT + 1}" in sql
+        assert "ORDER BY source_url" in sql
+        assert "it''s\\_50\\%" in sql
+        assert sql.count("ESCAPE '\\'") == 3
+
+    def test_worker_reports_ids_and_whether_more_matched(self, qapp):
+        from biopb_napari_widget.tensor_browser._widget import (
+            SERVER_QUERY_LIMIT,
+            _SearchWorker,
+        )
+
+        client = MagicMock()
+        client.query.return_value = [{"source_id": f"s{i}"} for i in range(5)]
+        got = []
+        worker = _SearchWorker(client, "q", 7)
+        worker.done.connect(lambda g, ids, more: got.append((g, ids, more)))
+        worker.run()
+        assert got == [(7, {f"s{i}" for i in range(5)}, False)]
+
+        client.query.return_value = [
+            {"source_id": f"s{i}"} for i in range(SERVER_QUERY_LIMIT + 1)
+        ]
+        got.clear()
+        worker.run()
+        g, ids, more = got[0]
+        assert len(ids) == SERVER_QUERY_LIMIT and more is True
+
+    def test_worker_failure_is_reported(self, qapp):
+        from biopb_napari_widget.tensor_browser._widget import _SearchWorker
+
+        client = MagicMock()
+        client.query.side_effect = RuntimeError("boom")
+        failed = []
+        worker = _SearchWorker(client, "q", 3)
+        worker.failed.connect(failed.append)
+        worker.run()
+        assert failed == [3]
+
+    def test_a_superseded_answer_is_dropped(self, widget):
+        w, _, _ = widget
+        w._search_generation = 5
+        w._on_search_done(4, {"a"}, True)
+        w._build_and_display_tree.assert_not_called()
+        assert w._search_more is False
+        w._on_search_done(5, {"a"}, True)
+        w._build_and_display_tree.assert_called_once_with(filtered_ids={"a"})
+        assert w._search_more is True
+
+    def test_server_search_runs_on_a_worker_and_leaves_the_tree_alone(
+        self, widget, monkeypatch
+    ):
+        from biopb_napari_widget.tensor_browser import _widget as widget_mod
+
+        w, _, _ = widget
+        w._list.use_server_query = True
+        w._conn.client = MagicMock()
+        started = []
+        monkeypatch.setattr(
+            widget_mod._SearchWorker, "start", lambda self: started.append(self)
+        )
+        w._filter_input.setText("abc")
+        w._apply_filter()
+        assert len(started) == 1
+        assert w._search_generation == 1
+        w._build_and_display_tree.assert_not_called()  # stays until the answer
+        assert "Searching" in w._search_status.text()
+
+        w._apply_filter()
+        assert w._search_generation == 2  # the first answer is now stale
+
+    def test_clearing_the_box_cancels_the_search(self, widget):
+        w, _, _ = widget
+        w._search_generation = 3
+        w._search_more = True
+        w._filter_input.setText("")
+        w._apply_filter()
+        assert w._search_generation == 4 and w._search_more is False
+        w._build_and_display_tree.assert_called_once_with()
+
+    def test_a_failed_search_falls_back_to_the_listing(self, widget):
+        w, _, _ = widget
+        w._list.sources = {"a": _source("a", tensors=["a"])}
+        w._filter_input.setText("a")
+        w._search_generation = 2
+        w._on_search_failed(1)  # stale: ignored
+        w._build_and_display_tree.assert_not_called()
+        w._on_search_failed(2)
+        w._build_and_display_tree.assert_called_once_with(filtered_ids={"a"})
+
+    def test_status_line_only_on_a_large_catalog(self, widget):
+        from biopb_napari_widget.tensor_browser._widget import SERVER_QUERY_LIMIT
+
+        w, _, _ = widget
+        w._list.sources = {"a": object(), "b": object()}
+        w._list.use_server_query = False
+        w._update_search_chrome()
+        assert w._search_status.isHidden()
+        w._list.use_server_query = True
+        w._search_more = True
+        w._update_search_chrome()
+        assert not w._search_status.isHidden()
+        text = w._search_status.text()
+        assert "2 sources" in text and f"First {SERVER_QUERY_LIMIT:,}" in text
+
+    def test_no_matches_is_an_empty_tree_not_the_whole_catalog(self, widget):
+        w, _, _ = widget
+        self._real_tree(w, {"a": _source("a", tensors=["a"])})
+        w._build_and_display_tree(filtered_ids=set())
+        assert w._tree_widget.topLevelItemCount() == 0
+        w._build_and_display_tree()
+        assert w._tree_widget.topLevelItemCount() == 1
+
+    def test_only_the_top_level_opens_by_itself(self, widget):
+        from biopb_napari_widget._catalog import CatalogSource, CatalogTensor
+
+        w, _, _ = widget
+
+        def src(sid, url):
+            return CatalogSource(
+                source_id=sid,
+                source_url=url,
+                tensors=(CatalogTensor(array_id=sid, shape=(8, 8), dtype="uint8"),),
+            )
+
+        self._real_tree(
+            w,
+            {
+                "m": src("m", "/lab/exp1/plateA/m.tif"),
+                "k": src("k", "/lab/exp1/plateB/k.tif"),
+                "n": src("n", "/lab/x/n.tif"),
+            },
+        )
+        w._build_and_display_tree(filtered_ids={"m", "k"})
+        # The top-level folder is open; the folders below it are not, and the
+        # non-matching branch is not built at all.
+        opened = w._expanded_folders
+        assert opened == {"/lab/exp1"}
+        assert not any(r.startswith("n.tif") for r in self._rows(w))
