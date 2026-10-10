@@ -1529,9 +1529,12 @@ class TestRoiAnnotations:
         from qtpy.QtWidgets import QMenu
 
         w._list.roi_sets = sets
-        menu = QMenu()
-        w._add_roi_actions(menu, "a", "a")
-        return menu
+        # Held on the test so the C++ menu (and its actions) outlive this call:
+        # a collected QMenu leaves its actions dangling, which crashes Windows
+        # and macOS Qt rather than failing.
+        self.menu = QMenu()
+        w._add_roi_actions(self.menu, "a", "a")
+        return self.menu
 
     def test_server_without_roi_support_has_no_entry(self, widget):
         w, _, _ = widget
