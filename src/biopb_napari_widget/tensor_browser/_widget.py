@@ -141,7 +141,7 @@ _LABEL_GLYPH = "\u25c9"
 _CLOUD_GLYPH = "\u2601"
 _CLOUD_TOOLTIP = "Cloud file, not downloaded. Resolving it downloads the whole file."
 #: Marks a source the server is still indexing in the background.
-_PENDING_GLYPH = "[...]"
+_PENDING_GLYPH = "\u22ef"
 _PENDING_TOOLTIP = "Being indexed in the background."
 _GLYPH_W, _GLYPH_H = 26, 16
 
@@ -1725,7 +1725,7 @@ class TensorBrowserWidget(QWidget):
             if glyph:
                 painter = QPainter(pix)
                 font = QFont(painter.font())
-                font.setPixelSize(_GLYPH_H if len(glyph) == 1 else _GLYPH_H - 2)
+                font.setPixelSize(_GLYPH_H)
                 font.setBold(True)
                 painter.setFont(font)
                 color = self._tree_widget.palette().color(
