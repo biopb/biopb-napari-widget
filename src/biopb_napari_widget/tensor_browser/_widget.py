@@ -17,7 +17,8 @@ from typing import TYPE_CHECKING, Dict, List, NamedTuple, Sequence, Set
 from urllib.parse import urlparse
 
 from biopb.tensor import Connection, ResolveCancelled
-from qtpy.QtCore import Qt, QThread, QTimer, Signal
+from qtpy.QtCore import QSize, Qt, QThread, QTimer, Signal
+from qtpy.QtGui import QColor, QFont, QIcon, QPainter, QPixmap
 from qtpy.QtWidgets import (
     QApplication,
     QDialog,
@@ -136,6 +137,14 @@ def _get_path_parts(url: str) -> List[str]:
 # carries the set's name and shape, and the tree elides long labels.
 _LABEL_GLYPH = "\u25c9"
 
+#: Marks a source row whose file is a cloud placeholder (``needs_recall``).
+_CLOUD_GLYPH = "\u2601"
+_CLOUD_TOOLTIP = "Cloud file, not downloaded. Resolving it downloads the whole file."
+#: Marks a source the server is still indexing in the background.
+_PENDING_GLYPH = "[...]"
+_PENDING_TOOLTIP = "Being indexed in the background."
+_GLYPH_W, _GLYPH_H = 26, 16
+
 
 def _format_shape(shape: List[int]) -> str:
     """Format shape as compact string."""
@@ -217,22 +226,23 @@ def _is_unresolved(src: CatalogSource) -> bool:
     return not src.is_resolved
 
 
-#: Reasons a source is unresolved other than a cloud placeholder, with the row
-#: suffix each gets.
-_UNRESOLVED_BADGES = {"pending": "  [indexing…]", "failed": "  [failed]"}
+#: Reasons a source is unresolved other than a cloud placeholder.
+_NOT_RECALL_REASONS = frozenset({"pending", "failed"})
+#: Row suffix for the reasons that get one ("pending" gets a glyph instead).
+_UNRESOLVED_BADGES = {"failed": "  [failed]"}
 
 
 def _needs_recall(src: CatalogSource) -> bool:
     """An unresolved source whose resolve downloads a cloud file, so it needs the
     user's consent. Anything the server has not said is ``pending`` or ``failed``
     counts, including an older server that gives no reason at all."""
-    return _is_unresolved(src) and src.unresolved_reason not in _UNRESOLVED_BADGES
+    return _is_unresolved(src) and src.unresolved_reason not in _NOT_RECALL_REASONS
 
 
 def _unresolved_badge(src: CatalogSource) -> str:
-    """Row suffix for a source the server has not registered: it is being
-    indexed in the background, or that failed. Empty for a cloud placeholder
-    and for a resolved source."""
+    """Row suffix for a source the server failed to register. Empty for a
+    cloud placeholder, a pending one (see :func:`_row_glyph`) and a resolved
+    source."""
     if not _is_unresolved(src):
         return ""
     return _UNRESOLVED_BADGES.get(src.unresolved_reason, "")
@@ -1036,6 +1046,7 @@ class TensorBrowserWidget(QWidget):
         _header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self._tree_widget.setExpandsOnDoubleClick(False)
         self._tree_widget.setIndentation(12)
+        self._tree_widget.setIconSize(QSize(_GLYPH_W, _GLYPH_H))
         # Column 0 stretches to the viewport and row text elides (ElideRight is
         # the QTreeView default), so a horizontal scrollbar is never needed. Pin
         # it off: left ScrollBarAsNeeded, its show/hide toggles as the widest
@@ -1704,6 +1715,28 @@ class TensorBrowserWidget(QWidget):
         # the logical selection (issue #191).
         self._restore_selection()
 
+    def _glyph_icon(self, glyph: str) -> QIcon:
+        """A fixed-size icon drawing *glyph* ("" gives a transparent one), so a
+        row with the glyph and a row without it keep their text aligned."""
+        cache = self.__dict__.setdefault("_glyph_icons", {})
+        if glyph not in cache:
+            pix = QPixmap(_GLYPH_W, _GLYPH_H)
+            pix.fill(Qt.GlobalColor.transparent)
+            if glyph:
+                painter = QPainter(pix)
+                font = QFont(painter.font())
+                font.setPixelSize(_GLYPH_H if len(glyph) == 1 else _GLYPH_H - 2)
+                font.setBold(True)
+                painter.setFont(font)
+                color = self._tree_widget.palette().color(
+                    self._tree_widget.foregroundRole()
+                )
+                painter.setPen(QColor(color))
+                painter.drawText(pix.rect(), Qt.AlignmentFlag.AlignCenter, glyph)
+                painter.end()
+            cache[glyph] = QIcon(pix)
+        return cache[glyph]
+
     def _add_tree_node(self, parent, node: _TreeNode):
         """Add a tree node to the widget."""
         item = QTreeWidgetItem(parent)
@@ -1749,6 +1782,16 @@ class TensorBrowserWidget(QWidget):
             # full label -- which elides when it outgrows the panel -- is only
             # readable on hover.
             item.setToolTip(0, display_name)
+            # Every source row gets an icon slot, blank unless it is a cloud
+            # placeholder or still indexing, so the names stay aligned.
+            glyph, note = "", ""
+            if _needs_recall(src):
+                glyph, note = _CLOUD_GLYPH, _CLOUD_TOOLTIP
+            elif _is_unresolved(src) and src.unresolved_reason == "pending":
+                glyph, note = _PENDING_GLYPH, _PENDING_TOOLTIP
+            item.setIcon(0, self._glyph_icon(glyph))
+            if note:
+                item.setToolTip(0, f"{display_name}\n{note}")
 
             # Nested rows: one per image when the source has several, and one
             # per label set under the image it annotates. A set is always its

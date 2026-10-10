@@ -563,6 +563,61 @@ class TestSourcesChangedGuard:
         w._apply_filter.assert_not_called()
 
 
+class TestCloudGlyph:
+    """A `needs_recall` source row carries a cloud glyph; every source row has
+    the same icon slot so the names stay aligned."""
+
+    def _row(self, w, name, **kw):
+        from biopb_napari_widget.tensor_browser._widget import _TreeNode
+
+        src = _source(name, tensors=[], is_resolved=False, **kw)
+        node = _TreeNode(
+            node_id=name, name=name, node_type="source", depth=0, source=src
+        )
+        w._add_tree_node(w._tree_widget, node)
+        return w._tree_widget.topLevelItem(w._tree_widget.topLevelItemCount() - 1)
+
+    def test_glyph_only_for_needs_recall(self, widget):
+        w, _, _ = widget
+        cloud = self._row(w, "a", unresolved_reason="needs_recall")
+        legacy = self._row(w, "b", unresolved_reason=None)
+        pending = self._row(w, "c", unresolved_reason="pending")
+        failed = self._row(w, "d", unresolved_reason="failed")
+        assert "download" in cloud.toolTip(0)
+        # An older server gives no reason; that still means a cloud file.
+        assert "download" in legacy.toolTip(0)
+        for row in (pending, failed):
+            assert "download" not in row.toolTip(0)
+        assert "indexed" in pending.toolTip(0)
+        assert "indexed" not in cloud.toolTip(0)
+
+    def test_icon_slot_is_the_same_size_for_every_source_row(self, widget):
+        w, _, _ = widget
+        cloud = self._row(w, "a", unresolved_reason="needs_recall")
+        pending = self._row(w, "c", unresolved_reason="pending")
+        size = lambda it: it.icon(0).availableSizes()[0]  # noqa: E731
+        assert not cloud.icon(0).isNull() and not pending.icon(0).isNull()
+        assert size(cloud) == size(pending)
+        # The pending row's slot is blank, the cloud row's is not.
+        blank = pending.icon(0).pixmap(size(pending)).toImage()
+        drawn = cloud.icon(0).pixmap(size(cloud)).toImage()
+        assert blank != drawn
+
+    def test_glyph_gone_after_resolve(self, widget):
+        w, _, _ = widget
+        row = self._row(w, "a", unresolved_reason="needs_recall")
+        assert "download" in row.toolTip(0)
+        from biopb_napari_widget.tensor_browser._widget import _TreeNode
+
+        src = _source("a", tensors=[], is_resolved=True)
+        w._add_tree_node(
+            w._tree_widget,
+            _TreeNode(node_id="a", name="a", node_type="source", depth=0, source=src),
+        )
+        resolved = w._tree_widget.topLevelItem(1)
+        assert "download" not in resolved.toolTip(0)
+
+
 class TestRemoveButton:
     """`_add_tree_node` puts a remove [x] in column 1 for dropped roots only."""
 
@@ -852,7 +907,7 @@ class TestUnresolvedReasonHelpers:
         def src(reason):
             return _source("c", tensors=[], is_resolved=False, unresolved_reason=reason)
 
-        assert "indexing" in _unresolved_badge(src("pending"))
+        assert _unresolved_badge(src("pending")) == ""
         assert "failed" in _unresolved_badge(src("failed"))
         assert _unresolved_badge(src("needs_recall")) == ""
         assert _unresolved_badge(src(None)) == ""
