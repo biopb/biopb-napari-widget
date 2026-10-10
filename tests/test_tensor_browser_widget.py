@@ -7,20 +7,14 @@ worker thread is *captured* rather than really spawned, so the test runs it
 explicitly and can assert both the in-flight ("Connecting…") and completed
 states. The connection and the source list are fakes.
 
-A real ``napari`` viewer (and thus a Qt/OpenGL context) is required, so the
-suite is skipped on macOS CI like the other viewer tests.
+The widget only stores the viewer and hands it to ``add_tensor_layer``, so a
+stand-in viewer is used: building a real napari viewer (a Qt/OpenGL window) for
+every test was slow and segfaulted intermittently inside napari on CI.
 """
 
-import os
-import sys
 from unittest.mock import MagicMock
 
 import pytest
-
-pytestmark = pytest.mark.skipif(
-    sys.platform == "darwin" and os.getenv("CI") == "true",
-    reason="OpenGL context unavailable on macOS CI headless environment",
-)
 
 
 class TestGetPathParts:
@@ -153,13 +147,13 @@ def _walk(node):
 
 
 @pytest.fixture
-def widget(make_napari_viewer, monkeypatch):
+def widget(qapp, monkeypatch):
     from qtpy.QtCore import QTimer
 
     from biopb_napari_widget.tensor_browser import _widget as widget_mod
     from biopb_napari_widget.tensor_browser._widget import TensorBrowserWidget
 
-    viewer = make_napari_viewer(show=False)
+    viewer = MagicMock(name="viewer")
     conn = MagicMock()
     conn.url = "grpc://localhost:8815"
     # Default outcome: a connect that resolved to "not connected" (down). Tests
@@ -563,6 +557,97 @@ class TestSourcesChangedGuard:
         w._apply_filter.assert_not_called()
 
 
+class TestRowShape:
+    @pytest.mark.parametrize(
+        "shape,expect",
+        [
+            ([1, 1, 5, 512, 512], "5×512×512"),
+            ([1, 3, 512, 512], "3×512×512"),
+            ([512, 512], "512×512"),
+            ([5, 1, 512], "5×1×512"),  # only *leading* singletons go
+            ([1, 1, 1], "1"),
+        ],
+    )
+    def test_leading_singletons_are_squeezed(self, shape, expect):
+        from biopb_napari_widget.tensor_browser._widget import _row_shape
+
+        assert _row_shape(shape) == expect
+
+    def test_row_keeps_the_shape_as_a_suffix_not_in_its_text(self, widget):
+        from biopb_napari_widget.tensor_browser._widget import _SUFFIX_ROLE, _TreeNode
+
+        w, _, _ = widget
+        src = _source("a", tensors=["a"])
+        w._add_tree_node(
+            w._tree_widget,
+            _TreeNode(
+                node_id="a", name="a.zarr", node_type="source", depth=0, source=src
+            ),
+        )
+        item = w._tree_widget.topLevelItem(0)
+        assert item.text(0) == "a.zarr"
+        assert item.data(0, _SUFFIX_ROLE) == "8×8"
+        assert "[" not in item.toolTip(0)
+
+
+class TestCloudGlyph:
+    """A `needs_recall` source row carries a cloud glyph; every source row has
+    the same icon slot so the names stay aligned."""
+
+    def _row(self, w, name, **kw):
+        from biopb_napari_widget.tensor_browser._widget import _TreeNode
+
+        src = _source(name, tensors=[], is_resolved=False, **kw)
+        node = _TreeNode(
+            node_id=name, name=name, node_type="source", depth=0, source=src
+        )
+        w._add_tree_node(w._tree_widget, node)
+        return w._tree_widget.topLevelItem(w._tree_widget.topLevelItemCount() - 1)
+
+    def test_glyph_only_for_needs_recall(self, widget):
+        w, _, _ = widget
+        cloud = self._row(w, "a", unresolved_reason="needs_recall")
+        legacy = self._row(w, "b", unresolved_reason=None)
+        pending = self._row(w, "c", unresolved_reason="pending")
+        failed = self._row(w, "d", unresolved_reason="failed")
+        assert "download" in cloud.toolTip(0)
+        # An older server gives no reason; that still means a cloud file.
+        assert "download" in legacy.toolTip(0)
+        for row in (pending, failed):
+            assert "download" not in row.toolTip(0)
+        assert "indexed" in pending.toolTip(0)
+        assert "indexed" not in cloud.toolTip(0)
+
+    def test_icon_slot_is_the_same_size_for_every_source_row(self, widget):
+        w, _, _ = widget
+        cloud = self._row(w, "a", unresolved_reason="needs_recall")
+        pending = self._row(w, "c", unresolved_reason="pending")
+        plain = self._row(w, "d", unresolved_reason="failed")  # no glyph
+        rows = (cloud, pending, plain)
+        size = lambda it: it.icon(0).availableSizes()[0]  # noqa: E731
+        assert all(not r.icon(0).isNull() for r in rows)
+        assert size(cloud) == size(pending) == size(plain)
+        # Only the plain row's slot is blank; a glyph draws something. (The two
+        # glyphs are not compared with each other: a font may lack either.)
+        image = lambda it: it.icon(0).pixmap(size(it)).toImage()  # noqa: E731
+        assert image(cloud) != image(plain)
+        assert image(pending) != image(plain)
+
+    def test_glyph_gone_after_resolve(self, widget):
+        w, _, _ = widget
+        row = self._row(w, "a", unresolved_reason="needs_recall")
+        assert "download" in row.toolTip(0)
+        from biopb_napari_widget.tensor_browser._widget import _TreeNode
+
+        src = _source("a", tensors=[], is_resolved=True)
+        w._add_tree_node(
+            w._tree_widget,
+            _TreeNode(node_id="a", name="a", node_type="source", depth=0, source=src),
+        )
+        resolved = w._tree_widget.topLevelItem(1)
+        assert "download" not in resolved.toolTip(0)
+
+
 class TestRemoveButton:
     """`_add_tree_node` puts a remove [x] in column 1 for dropped roots only."""
 
@@ -669,7 +754,7 @@ class TestHidesEmptySources:
             widget,
             [self._src("empty", tensors=[]), self._src("full", tensors=["full"])],
         )
-        assert names == ["full.zarr  [8×8]"]
+        assert names == ["full.zarr"]
 
     def test_an_unresolved_source_still_gets_its_row(self, widget):
         # Its empty tensor list means "unknown", not "nothing" -- it still
@@ -852,7 +937,7 @@ class TestUnresolvedReasonHelpers:
         def src(reason):
             return _source("c", tensors=[], is_resolved=False, unresolved_reason=reason)
 
-        assert "indexing" in _unresolved_badge(src("pending"))
+        assert _unresolved_badge(src("pending")) == ""
         assert "failed" in _unresolved_badge(src("failed"))
         assert _unresolved_badge(src("needs_recall")) == ""
         assert _unresolved_badge(src(None)) == ""
