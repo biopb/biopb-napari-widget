@@ -458,6 +458,65 @@ def _dir_exceeds_entry_threshold(path: str) -> bool:
     return False
 
 
+#: Most matches a server-side search shows. The server's own cap is a safety
+#: valve, not a page size: every row is an id to ship, a tree node to build and a
+#: row to render, and nobody reads a hundred thousand results. One more than this
+#: is asked for, so "there were more" is known without a count.
+SERVER_QUERY_LIMIT = 2000
+
+#: Deepest folder level a search opens by itself. A match deep in a big tree would
+#: otherwise open every folder on the way down; the top level shows where the
+#: matches are, and the user opens what they want.
+AUTO_EXPAND_DEPTH = 1
+
+
+def _search_sql(query: str) -> str:
+    """The catalog query for a (lowercased, trimmed) search *query*: ids of the
+    sources whose id, url or type contain it, in url order, one past the limit."""
+    escaped = query.replace("\\", "\\\\").replace("'", "''")
+    escaped = escaped.replace("%", "\\%").replace("_", "\\_")
+    return (
+        "SELECT source_id FROM sources WHERE "
+        f"LOWER(source_id) LIKE '%{escaped}%' ESCAPE '\\' OR "
+        f"LOWER(source_url) LIKE '%{escaped}%' ESCAPE '\\' OR "
+        f"LOWER(source_type) LIKE '%{escaped}%' ESCAPE '\\' "
+        f"ORDER BY source_url LIMIT {SERVER_QUERY_LIMIT + 1}"
+    )
+
+
+class _SearchWorker(QThread):
+    """Runs one server-side search off the GUI thread.
+
+    A search over a large catalog is a round trip plus a scan; run on the GUI
+    thread it freezes the window on every pause in typing. Answers can arrive
+    out of order, so each carries the generation it was asked for and the widget
+    drops the superseded ones.
+    """
+
+    done = Signal(int, object, bool)  # generation, source ids, more matched
+    failed = Signal(int)
+
+    def __init__(self, client, query: str, generation: int):
+        super().__init__()
+        self._client = client
+        self._query = query
+        self._generation = generation
+
+    def run(self):
+        try:
+            rows = self._client.query(_search_sql(self._query), format="records")
+        except Exception:
+            logger.exception("Server search failed")
+            self.failed.emit(self._generation)
+            return
+        ids = [row["source_id"] for row in rows]
+        self.done.emit(
+            self._generation,
+            set(ids[:SERVER_QUERY_LIMIT]),
+            len(ids) > SERVER_QUERY_LIMIT,
+        )
+
+
 def _count(result, field: str) -> int:
     """A count field of an add result, 0 when an older server omits it."""
     return int(getattr(result, field, 0) or 0)
@@ -661,40 +720,6 @@ def _build_tree(sources: Dict[str, CatalogSource]) -> _TreeNode:
 
     flatten_paths(root)
     return root
-
-
-def _filter_tree(
-    node: _TreeNode,
-    matching_ids: Set[str],
-    expanded_folders: Set[str],
-) -> _TreeNode | None:
-    """Filter tree to show only matching sources, auto-expand folders."""
-    if node.node_type == "source":
-        if node.node_id in matching_ids:
-            return node
-        return None
-
-    # Folder: filter children
-    filtered_children: List[_TreeNode] = []
-    for child in node.children:
-        filtered = _filter_tree(child, matching_ids, expanded_folders)
-        if filtered:
-            filtered_children.append(filtered)
-            # Auto-expand folders containing matches
-            if filtered.node_type == "source" or filtered.children:
-                expanded_folders.add(node.node_id)
-
-    if not filtered_children:
-        return None
-
-    result = _TreeNode(
-        node_id=node.node_id,
-        name=node.name,
-        node_type=node.node_type,
-        depth=node.depth,
-    )
-    result.children = filtered_children
-    return result
 
 
 # ==============================================================================
@@ -1002,6 +1027,14 @@ class TensorBrowserWidget(QWidget):
         # ownership rule as the add worker.
         self._remove_worker: _RemoveSourceWorker | None = None
         self._remove_retain: set = set()
+        # Server-side search: the generation of the query whose answer is wanted
+        # (bumped by every new query and every clear, so a late answer is
+        # dropped), the worker running it, and whether more sources matched than
+        # the limit let through.
+        self._search_generation = 0
+        self._search_worker: _SearchWorker | None = None
+        self._search_retain: set = set()
+        self._search_more = False
         self._setup_ui()
 
         # Self-heal the tree when the watcher re-lists a catalog listed
@@ -1115,6 +1148,12 @@ class TensorBrowserWidget(QWidget):
         self._filter_input.textChanged.connect(self._on_filter_text_changed)
         filter_layout.addWidget(self._filter_input)
         layout.addLayout(filter_layout)
+        # Under the search box on a large catalog: how many sources, that the
+        # filter runs on the server, and whether the answer is partial.
+        self._search_status = QLabel()
+        self._search_status.setStyleSheet("color: gray; font-size: 11px;")
+        self._search_status.setVisible(False)
+        layout.addWidget(self._search_status)
 
         # Debounce timer for filter
         self._filter_timer = QTimer(self)
@@ -1308,13 +1347,11 @@ class TensorBrowserWidget(QWidget):
             return
 
         if self._use_server_query:
-            self._filter_input.setPlaceholderText("Search (SQL filter)")
             logger.info(
                 "Large catalog (%d sources), server-side SQL filter enabled",
                 len(sources),
             )
-        else:
-            self._filter_input.setPlaceholderText("Search sources...")
+        self._update_search_chrome()
 
         self._build_and_display_tree()
         self._refresh_button.setEnabled(True)
@@ -1733,12 +1770,8 @@ class TensorBrowserWidget(QWidget):
                 self._tree_widget.clear()
                 return
 
+            self._update_search_chrome()
             self._build_and_display_tree()
-
-            if self._use_server_query:
-                self._filter_input.setPlaceholderText("Search (SQL filter)")
-            else:
-                self._filter_input.setPlaceholderText("Search sources...")
         except Exception:
             # The server answered; rendering the catalog is a client-side step,
             # so a failure here is not a lost connection -- report it without
@@ -1764,6 +1797,7 @@ class TensorBrowserWidget(QWidget):
         """Stop the watcher; the list is this widget's alone."""
         self._list.on_changed = None
         self._list.stop_watch()
+        self._search_generation += 1  # a search still out has nobody to tell
         super().closeEvent(event)
 
     def _build_and_display_tree(self, filtered_ids: Set[str] | None = None):
@@ -1775,25 +1809,25 @@ class TensorBrowserWidget(QWidget):
 
         # Build tree. Empty sources are dropped unconditionally, before a
         # search filter narrows further -- a source with nothing on it is
-        # never worth a row, matching or not.
+        # never worth a row, matching or not. A search builds the tree from the
+        # matches alone, so its cost follows the result, not the catalog; an
+        # empty match set is an empty tree, not the whole catalog.
         visible = {
             source_id: src
             for source_id, src in self._sources.items()
             if not _is_empty_source(src)
+            and (filtered_ids is None or source_id in filtered_ids)
         }
-        root = _build_tree(visible)
-
-        # Apply filter if provided
-        display_tree = root
-        if filtered_ids:
-            new_expanded = set(self._expanded_folders)
-            filtered = _filter_tree(root, filtered_ids, new_expanded)
-            if filtered:
-                display_tree = filtered
-                self._expanded_folders = new_expanded
-            else:
-                # No matches
-                return
+        if not visible:
+            return
+        display_tree = _build_tree(visible)
+        if filtered_ids is not None:
+            # Open the top levels so the user sees where the matches are.
+            level = display_tree.children
+            for _ in range(AUTO_EXPAND_DEPTH):
+                folders = [n for n in level if n.node_type == "folder"]
+                self._expanded_folders.update(n.node_id for n in folders)
+                level = [c for n in folders for c in n.children]
 
         # Populate tree widget
         for child in display_tree.children:
@@ -1802,7 +1836,7 @@ class TensorBrowserWidget(QWidget):
         # First unfiltered render: seed every top-level node as expanded so the
         # first level of leaves is visible up front. Persisted via the normal
         # expand-state set so it survives rebuilds and the user can collapse it.
-        if not self._initial_expand_done and not filtered_ids:
+        if not self._initial_expand_done and filtered_ids is None:
             for child in display_tree.children:
                 self._expanded_folders.add(child.node_id)
             self._initial_expand_done = True
@@ -2415,7 +2449,10 @@ class TensorBrowserWidget(QWidget):
         query = self._filter_input.text().strip().lower()
 
         if not query:
-            # Clear filter
+            # Clear filter; an answer still in flight is no longer wanted.
+            self._search_generation += 1
+            self._search_more = False
+            self._update_search_chrome()
             self._build_and_display_tree()
             return
 
@@ -2424,26 +2461,53 @@ class TensorBrowserWidget(QWidget):
             self._apply_server_filter(query)
         else:
             # Client-side filter
+            self._search_generation += 1
+            self._search_more = False
+            self._update_search_chrome()
             self._apply_client_filter(query)
 
     def _apply_server_filter(self, query: str):
-        """Apply server-side SQL filter for large catalogs."""
-        try:
-            # Escape SQL special characters
-            escaped = query.replace("'", "''").replace("%", "\\%").replace("_", "\\_")
-            sql = (
-                f"SELECT source_id FROM sources WHERE "
-                f"LOWER(source_id) LIKE '%{escaped}%' OR "
-                f"LOWER(source_url) LIKE '%{escaped}%' OR "
-                f"LOWER(source_type) LIKE '%{escaped}%'"
-            )
-            rows = self._client.query(sql, format="records")
-            ids = {row["source_id"] for row in rows}
-            self._build_and_display_tree(filtered_ids=ids)
-        except Exception:
-            logger.exception("Server filter failed")
-            # Fall back to client-side filter
-            self._apply_client_filter(query)
+        """Ask the server for the matches, off the GUI thread. The tree stays as
+        it is until the answer lands."""
+        self._search_generation += 1
+        worker = _SearchWorker(self._client, query, self._search_generation)
+        self._search_worker = worker
+        self._search_retain.add(worker)
+        worker.done.connect(self._on_search_done)
+        worker.failed.connect(self._on_search_failed)
+        worker.finished.connect(lambda w=worker: self._search_retain.discard(w))
+        self._update_search_chrome(searching=True)
+        worker.start()
+
+    def _on_search_done(self, generation: int, ids, more: bool):
+        if generation != self._search_generation:
+            return  # superseded while in flight
+        self._search_more = more
+        self._update_search_chrome()
+        self._build_and_display_tree(filtered_ids=ids)
+
+    def _on_search_failed(self, generation: int):
+        if generation != self._search_generation:
+            return
+        # Fall back to filtering the listing we already hold.
+        self._search_more = False
+        self._update_search_chrome()
+        self._apply_client_filter(self._filter_input.text().strip().lower())
+
+    def _update_search_chrome(self, searching: bool = False):
+        """The search box's placeholder and the line under it."""
+        if not self._use_server_query:
+            self._filter_input.setPlaceholderText("Search sources...")
+            self._search_status.setVisible(False)
+            return
+        self._filter_input.setPlaceholderText("Search (SQL filter)")
+        text = f"{len(self._sources):,} sources • Server-side filter"
+        if searching:
+            text += " • Searching…"
+        elif self._search_more:
+            text += f" • First {SERVER_QUERY_LIMIT:,} matches shown, refine the search"
+        self._search_status.setText(text)
+        self._search_status.setVisible(True)
 
     def _apply_client_filter(self, query: str):
         """Apply client-side filter."""
