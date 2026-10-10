@@ -628,13 +628,16 @@ class TestCloudGlyph:
         w, _, _ = widget
         cloud = self._row(w, "a", unresolved_reason="needs_recall")
         pending = self._row(w, "c", unresolved_reason="pending")
+        plain = self._row(w, "d", unresolved_reason="failed")  # no glyph
+        rows = (cloud, pending, plain)
         size = lambda it: it.icon(0).availableSizes()[0]  # noqa: E731
-        assert not cloud.icon(0).isNull() and not pending.icon(0).isNull()
-        assert size(cloud) == size(pending)
-        # The pending row's slot is blank, the cloud row's is not.
-        blank = pending.icon(0).pixmap(size(pending)).toImage()
-        drawn = cloud.icon(0).pixmap(size(cloud)).toImage()
-        assert blank != drawn
+        assert all(not r.icon(0).isNull() for r in rows)
+        assert size(cloud) == size(pending) == size(plain)
+        # Only the plain row's slot is blank; a glyph draws something. (The two
+        # glyphs are not compared with each other: a font may lack either.)
+        image = lambda it: it.icon(0).pixmap(size(it)).toImage()  # noqa: E731
+        assert image(cloud) != image(plain)
+        assert image(pending) != image(plain)
 
     def test_glyph_gone_after_resolve(self, widget):
         w, _, _ = widget
