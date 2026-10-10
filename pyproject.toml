@@ -30,8 +30,6 @@ dependencies = [
     "magicgui",
     "qtpy",
     "opencv-python-headless",
-    # grpc_health.v1, for the image-processing widgets' server check.
-    "grpcio-health-checking",
 ]
 
 [project.optional-dependencies]

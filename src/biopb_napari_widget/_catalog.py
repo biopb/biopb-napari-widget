@@ -1,7 +1,7 @@
 """This package's view of a ``sources`` catalog row.
 
 The SDK hands back rows and deliberately picks no structure for them
-(biopb/biopb#1032): ``query_sources`` answers in whichever format you ask for,
+(biopb/biopb#1032): ``query`` answers in whichever format you ask for,
 ``resolve`` returns the one row it just wrote, and choosing what to decode them
 into is the caller's job. This module is that choice, made once for this package.
 
@@ -64,7 +64,7 @@ class CatalogSource:
 
 
 def source_from_row(row: Mapping[str, Any]) -> CatalogSource:
-    """One ``sources`` row (as ``query_sources(format="records")`` yields it)."""
+    """One ``sources`` row (as ``query(format="records")`` yields it)."""
     tensors = tuple(
         CatalogTensor(
             array_id=t["array_id"],

@@ -26,10 +26,10 @@ def _listing(ids, health=()):
     """A SourceList already holding *ids*; the server then answers *health*."""
     client = MagicMock()
     client.catalog = list(ids)
-    client.query_sources.side_effect = lambda sql, **kw: _rows(client.catalog)
+    client.query.side_effect = lambda sql, **kw: _rows(client.catalog)
     listing = SourceList(SimpleNamespace(client=client))
     listing.refresh()
-    client.query_sources.reset_mock()
+    client.query.reset_mock()
     client.health_check.side_effect = list(health)
     return listing, client
 
@@ -80,12 +80,12 @@ class TestWatch:
             ["a", "b"], [{"source_count": 2}, {"source_count": 2}]
         )
         _watch(listing, 2)
-        client.query_sources.assert_not_called()
+        client.query.assert_not_called()
 
     def test_a_health_error_is_tolerated(self):
         listing, client = _listing(["a"], [RuntimeError("blip")])
         _watch(listing, 1)
-        client.query_sources.assert_not_called()
+        client.query.assert_not_called()
 
     def test_disconnected_polls_nothing(self):
         listing, client = _listing(["a"])
@@ -95,7 +95,7 @@ class TestWatch:
 
     def test_a_failed_relist_keeps_the_watcher_alive(self):
         listing, client = _listing(["a"], [{"source_count": 2}, {"source_count": 3}])
-        client.query_sources.side_effect = RuntimeError("list boom")
+        client.query.side_effect = RuntimeError("list boom")
         _watch(listing, 2)
         assert client.health_check.call_count == 2
 
@@ -121,7 +121,7 @@ class TestVerbs:
 
     def test_resolve_returns_the_row_it_committed(self):
         listing, client = _listing(["a"])
-        client.resolve.return_value = _rows(["a"])[0]
+        client.resolve_source.return_value = _rows(["a"])[0]
         assert listing.resolve("a").source_id == "a"
 
     def test_use_server_query_follows_the_size(self):
@@ -131,25 +131,25 @@ class TestVerbs:
 
 def test_add_sends_cloud_only_when_set():
     client = MagicMock()
-    client.query_sources.return_value = []
+    client.query.return_value = []
     conn = MagicMock(client=client)
     sources = SourceList(conn)
 
     sources.add("/A")
-    assert "cloud" not in client.add_source.call_args.kwargs
+    assert "cloud" not in client.register_local_path.call_args.kwargs
     sources.add("/A", cloud=True)
-    assert client.add_source.call_args.kwargs["cloud"] is True
+    assert client.register_local_path.call_args.kwargs["cloud"] is True
 
 
 def test_add_drops_cloud_for_an_sdk_that_does_not_take_it():
     calls = []
 
-    def add_source(path, *, on_progress=None, should_cancel=None):
+    def register_local_path(path, *, on_progress=None, should_cancel=None):
         calls.append(path)
 
     client = MagicMock()
-    client.query_sources.return_value = []
-    client.add_source = add_source
+    client.query.return_value = []
+    client.register_local_path = register_local_path
     SourceList(SimpleNamespace(client=client)).add("/A", cloud=True)
 
     assert calls == ["/A"]
@@ -161,16 +161,16 @@ class TestUnresolvedReason:
         client.source_row_columns.return_value = (
             "source_id, is_resolved, unresolved_reason"
         )
-        client.query_sources.return_value = []
+        client.query.return_value = []
         SourceList(SimpleNamespace(client=client)).refresh()
-        sql = client.query_sources.call_args[0][0]
+        sql = client.query.call_args[0][0]
         assert "unresolved_reason" in sql
 
     def test_an_sdk_without_the_projector_lists_the_base_columns(self):
-        client = MagicMock(spec=["query_sources"])
-        client.query_sources.return_value = []
+        client = MagicMock(spec=["query"])
+        client.query.return_value = []
         SourceList(SimpleNamespace(client=client)).refresh()
-        sql = client.query_sources.call_args[0][0]
+        sql = client.query.call_args[0][0]
         assert "unresolved_reason" not in sql and "is_resolved" in sql
 
     def test_the_reason_is_carried_and_absent_on_an_older_server(self):
@@ -195,9 +195,9 @@ class TestWatchPending:
         )
         _watch(listing, 4)
         # a re-list on each change of the pending figure (2, 1, 0), none between
-        assert client.query_sources.call_count == 3
+        assert client.query.call_count == 3
 
     def test_an_older_server_without_the_field_behaves_as_before(self):
         listing, client = _listing(["a"], [{"source_count": 1}, {"source_count": 1}])
         _watch(listing, 2)
-        client.query_sources.assert_not_called()
+        client.query.assert_not_called()
