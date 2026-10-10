@@ -3,7 +3,8 @@
 [napari](https://napari.org) widgets for [biopb](https://biopb.org):
 
 - **Tensor Browser**: browse the images a biopb data server holds, and open
-  them in napari as multiscale layers that load on demand.
+  them in napari as multiscale layers that load on demand. Right-click an image
+  for *Load ROI annotations…* to add its points and shapes as layers.
 
 ## Install
 

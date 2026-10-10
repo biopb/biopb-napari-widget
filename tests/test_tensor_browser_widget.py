@@ -1518,3 +1518,207 @@ class TestSearch:
         opened = w._expanded_folders
         assert opened == {"/lab/exp1"}
         assert not any(r.startswith("n.tif") for r in self._rows(w))
+
+
+class TestRoiAnnotations:
+    """The ROI entry comes from the catalog's set names: absent when the server
+    cannot say, one entry for one set, a submenu for several; picking one fetches
+    just that set and adds Points / Shapes layers."""
+
+    def _menu(self, w, sets):
+        from qtpy.QtWidgets import QMenu
+
+        w._list.roi_sets = sets
+        w._list.sources = {"a": _source("a", tensors=["a"])}
+        # Held on the test so the C++ menu (and its actions) outlive this call:
+        # a collected QMenu leaves its actions dangling, which crashes Windows
+        # and macOS Qt rather than failing.
+        self.menu = QMenu()
+        w._add_roi_actions(self.menu, "a", "a")
+        return self.menu
+
+    def test_server_without_roi_support_has_no_entry(self, widget):
+        w, _, _ = widget
+        assert self._menu(w, None).actions() == []
+
+    def test_a_tensor_without_sets_has_no_entry(self, widget):
+        w, _, _ = widget
+        assert self._menu(w, {"other": {"s": 1}}).actions() == []
+
+    def test_one_set_is_one_entry(self, widget):
+        w, _, _ = widget
+        actions = self._menu(w, {"a": {"nuclei": 12}}).actions()
+        assert len(actions) == 1
+        assert "nuclei" in actions[0].text() and "12" in actions[0].text()
+
+    def test_several_sets_make_a_submenu_and_mark_reserved_ones(self, widget):
+        w, _, _ = widget
+        menu = self._menu(w, {"a": {"nuclei": 12, "@ome": 3}})  # keep it alive
+        (top,) = menu.actions()
+        texts = [a.text() for a in top.menu().actions()]
+        assert len(texts) == 2
+        assert any("@ome" in t and "read-only" in t for t in texts)
+        assert any("nuclei" in t and "read-only" not in t for t in texts)
+
+    def _context_menu_texts(self, w, monkeypatch, roi_sets):
+        """The texts of the real right-click menu on the source's row."""
+        from qtpy.QtCore import QPoint
+        from qtpy.QtWidgets import QMenu
+
+        from biopb_napari_widget.tensor_browser._widget import TensorBrowserWidget
+
+        w._list.sources = {"a": _source("a", tensors=["a"])}
+        w._list.roi_sets = roi_sets
+        w._build_and_display_tree = lambda **kw: (
+            TensorBrowserWidget._build_and_display_tree(w, **kw)
+        )
+        w._build_and_display_tree()
+        item = w._tree_widget.topLevelItem(0)
+        while item.childCount():  # down to the source row
+            item = item.child(0)
+        seen = []
+
+        def _exec(menu, *a):
+            def walk(m):
+                for act in m.actions():
+                    seen.append(act.text())
+                    if act.menu():
+                        walk(act.menu())
+
+            walk(menu)
+
+        monkeypatch.setattr(w._tree_widget, "itemAt", lambda pos: item)
+        monkeypatch.setattr(QMenu, "exec_", _exec)
+        w._show_context_menu(QPoint(0, 0))
+        return seen
+
+    def test_the_real_menu_has_no_roi_entry_when_the_array_carried_no_roi(
+        self, widget, monkeypatch
+    ):
+        w, _, _ = widget
+        for roi_sets in (
+            {},  # server supports it, nothing annotated
+            {"other": {"s": 1}},  # some other array has sets, this one none
+            {"a": {}},  # an entry with no sets
+            None,  # server cannot say
+        ):
+            texts = self._context_menu_texts(w, monkeypatch, roi_sets)
+            assert texts, "the menu itself must still be built"
+            assert not any("ROI" in t for t in texts), (roi_sets, texts)
+
+    def test_the_real_menu_has_the_roi_entry_when_it_did(self, widget, monkeypatch):
+        w, _, _ = widget
+        texts = self._context_menu_texts(w, monkeypatch, {"a": {"nuclei": 4}})
+        assert any("ROI" in t and "nuclei" in t for t in texts), texts
+
+    def test_picking_a_set_fetches_that_set(self, widget, monkeypatch):
+        from biopb_napari_widget.tensor_browser import _widget as widget_mod
+
+        w, _, _ = widget
+        w._list.sources = {"a": _source("a", tensors=["a"])}
+        w._conn.client = MagicMock()
+        started = []
+        monkeypatch.setattr(
+            widget_mod._RoiWorker, "start", lambda self: started.append(self)
+        )
+        monkeypatch.setattr(
+            widget_mod.QApplication, "setOverrideCursor", lambda *a: None
+        )
+        menu = self._menu(w, {"a": {"x": 1, "y": 2}})
+        menu.actions()[0].menu().actions()[1].trigger()  # menu stays referenced
+        assert len(started) == 1 and started[0]._set_name == "y"
+
+    def test_the_worker_fetches_the_set_and_builds_the_specs(self, qapp, monkeypatch):
+        from biopb.image import ROI, Point, RoiAnnotation
+
+        from biopb_napari_widget.tensor_browser import _widget as widget_mod
+
+        client = MagicMock()
+        client.list_rois.return_value = MagicMock(
+            rois=[
+                RoiAnnotation(
+                    roi_id="r", set_name="@ome", roi=ROI(point=Point(x=1.0, y=2.0))
+                )
+            ],
+            truncated=True,
+        )
+        monkeypatch.setattr(widget_mod, "image_scale", lambda *a: [1.0, 1.0])
+        desc = _source("a", tensors=["a"]).tensors[0]
+        got = []
+        worker = widget_mod._RoiWorker(client, "a", desc, "@ome")
+        worker.done.connect(lambda *a: got.append(a))
+        worker.run()
+        client.list_rois.assert_called_once_with("a", "@ome")
+        ((name, specs, truncated),) = got
+        assert name == "@ome" and truncated is True
+        assert [s.kind for s in specs] == ["points"]
+
+    def test_an_empty_set_gives_no_specs_and_no_scale_call(self, qapp, monkeypatch):
+        from biopb_napari_widget.tensor_browser import _widget as widget_mod
+
+        client = MagicMock()
+        client.list_rois.return_value = MagicMock(rois=[], truncated=False)
+        monkeypatch.setattr(
+            widget_mod,
+            "image_scale",
+            lambda *a: pytest.fail("no ROIs, no scale"),
+        )
+        desc = _source("a", tensors=["a"]).tensors[0]
+        got = []
+        worker = widget_mod._RoiWorker(client, "a", desc, "s")
+        worker.done.connect(lambda *a: got.append(a))
+        worker.run()
+        assert got == [("s", [], False)]
+
+    def test_a_fetch_error_is_reported(self, qapp):
+        from biopb_napari_widget.tensor_browser._widget import _RoiWorker
+
+        client = MagicMock()
+        client.list_rois.side_effect = RuntimeError("boom")
+        desc = _source("a", tensors=["a"]).tensors[0]
+        failed = []
+        worker = _RoiWorker(client, "a", desc, "s")
+        worker.failed.connect(failed.append)
+        worker.run()
+        assert failed == ["boom"]
+
+    def _specs(self, n=3):
+        from biopb.image import ROI, Point, RoiAnnotation
+
+        from biopb_napari_widget._rois import roi_layer_specs
+
+        rois = [
+            RoiAnnotation(
+                roi_id=f"r{i}",
+                set_name="nuclei",
+                roi=ROI(point=Point(x=i + 1.0, y=2.0)),
+            )
+            for i in range(n)
+        ]
+        return roi_layer_specs(rois, _source("a", tensors=["a"]).tensors[0])
+
+    def test_fetched_specs_become_layers(self, widget):
+        w, _, _ = widget
+        w._show_status = MagicMock()
+        w._on_rois_fetched("nuclei", self._specs(), False)
+        w._viewer.add_points.assert_called_once()
+        assert w._viewer.add_points.call_args.kwargs["name"] == "nuclei"
+
+    def test_an_empty_set_says_so(self, widget):
+        w, _, _ = widget
+        w._show_status = MagicMock()
+        w._on_rois_fetched("nuclei", [], False)
+        w._viewer.add_points.assert_not_called()
+        assert "empty" in w._show_status.call_args.args[0]
+
+    def test_truncation_is_reported(self, widget):
+        w, _, _ = widget
+        w._show_status = MagicMock()
+        w._on_rois_fetched("nuclei", self._specs(), True)
+        assert "truncated" in w._show_status.call_args.args[0]
+
+    def test_a_failure_to_fetch_is_reported(self, widget):
+        w, _, _ = widget
+        w._report_failure = MagicMock()
+        w._on_rois_failed("annotations disabled")
+        w._report_failure.assert_called_once()

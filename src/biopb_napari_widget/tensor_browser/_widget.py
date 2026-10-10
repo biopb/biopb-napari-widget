@@ -43,6 +43,7 @@ from qtpy.QtWidgets import (
 
 from .._catalog import CatalogSource
 from .._labels import split_label_array_id
+from .._rois import add_roi_layers, image_scale, roi_layer_specs
 from .._tensor_utils import add_tensor_layer
 from .._urls import is_local_url
 from ._sources import SourceList
@@ -515,6 +516,35 @@ class _SearchWorker(QThread):
             set(ids[:SERVER_QUERY_LIMIT]),
             len(ids) > SERVER_QUERY_LIMIT,
         )
+
+
+class _RoiWorker(QThread):
+    """Fetches one annotation set of a tensor and turns it into layer specs, off
+    the GUI thread -- the scale is a client call and a large set is a per-ROI
+    Python loop. Only adding the layers is left to the GUI thread."""
+
+    done = Signal(str, object, bool)  # set name, [RoiLayerSpec], truncated
+    failed = Signal(str)
+
+    def __init__(self, client, source_id: str, tensor_desc, set_name: str):
+        super().__init__()
+        self._client = client
+        self._source_id = source_id
+        self._tensor_desc = tensor_desc
+        self._set_name = set_name
+
+    def run(self):
+        try:
+            result = self._client.list_rois(self._tensor_desc.array_id, self._set_name)
+            rois = list(result.rois)
+            specs = []
+            if rois:
+                scale = image_scale(self._client, self._source_id, self._tensor_desc)
+                specs = roi_layer_specs(rois, self._tensor_desc, scale=scale)
+        except Exception as exc:  # surface the SDK/server message to the user
+            self.failed.emit(str(exc))
+            return
+        self.done.emit(self._set_name, specs, bool(getattr(result, "truncated", False)))
 
 
 def _count(result, field: str) -> int:
@@ -1035,6 +1065,8 @@ class TensorBrowserWidget(QWidget):
         self._search_worker: _SearchWorker | None = None
         self._search_retain: set = set()
         self._search_more = False
+        # In-flight ROI fetches, kept alive until they finish.
+        self._roi_retain: set = set()
         self._setup_ui()
 
         # Self-heal the tree when the watcher re-lists a catalog listed
@@ -2211,6 +2243,13 @@ class TensorBrowserWidget(QWidget):
             else:
                 view_action.setEnabled(False)
 
+        # ROI annotations: the sets a tensor has come from the catalog, so the
+        # entry is built from what is there and nothing is fetched until one is
+        # picked. Absent when the server cannot say (no queryable rois table);
+        # a label set has no entry in the catalog's map, so none either.
+        if tensor_id and not is_unresolved_source:
+            self._add_roi_actions(menu, source_id, tensor_id)
+
         # Metadata action
         meta_action = menu.addAction("Metadata")
         meta_action.triggered.connect(
@@ -2325,6 +2364,63 @@ class TensorBrowserWidget(QWidget):
         # slot above calls progress.close(). The worker's queued signal is
         # delivered inside this exec_, so a fast finish can't deadlock.
         progress.exec_()
+
+    def _add_roi_actions(self, menu, source_id: str, tensor_id: str):
+        """ "Load ROI annotations" for a tensor: one entry for a single set, a
+        submenu with one entry per set for several. A reserved (``@``) set is the
+        server's own -- read-only -- and says so."""
+        sets = (self._list.roi_sets or {}).get(tensor_id)
+        src = self._sources.get(source_id)
+        tensor_desc = next(
+            (t for t in (src.tensors if src else ()) if t.array_id == tensor_id), None
+        )
+        if not sets or tensor_desc is None:
+            return
+
+        target = menu
+        if len(sets) > 1:
+            target = menu.addMenu("Load ROI annotations")
+        for name, count in sorted(sets.items()):
+            tag = "  (read-only)" if name.startswith("@") else ""
+            text = f"{name}{tag}  ({count:,})"
+            if len(sets) == 1:
+                text = f"Load ROI annotations: {text}"
+            target.addAction(text).triggered.connect(
+                lambda _=False, n=name: self._load_rois(source_id, tensor_desc, n)
+            )
+
+    def _load_rois(self, source_id: str, tensor_desc, set_name: str):
+        """Fetch one annotation set, then add it as Points / Shapes layers."""
+        if not self._client:
+            return
+        self._clear_error()
+        QApplication.setOverrideCursor(Qt.BusyCursor)
+        worker = _RoiWorker(self._client, source_id, tensor_desc, set_name)
+        self._roi_retain.add(worker)
+        worker.done.connect(self._on_rois_fetched)
+        worker.failed.connect(self._on_rois_failed)
+        worker.finished.connect(lambda w=worker: self._roi_retain.discard(w))
+        worker.start()
+
+    def _on_rois_failed(self, message: str):
+        QApplication.restoreOverrideCursor()
+        self._report_failure("Could not load ROI annotations", message)
+
+    def _on_rois_fetched(self, set_name: str, specs, truncated: bool):
+        QApplication.restoreOverrideCursor()
+        if not specs:
+            self._show_status(f"ROI set “{set_name}” is empty.")
+            return
+        try:
+            layers = add_roi_layers(self._viewer, specs)
+        except Exception as exc:
+            logger.exception("Failed to add ROI layers")
+            self._report_failure("Could not load ROI annotations", str(exc))
+            return
+        note = f"Loaded {len(layers)} ROI layer{'' if len(layers) == 1 else 's'}."
+        if truncated:
+            note += " The server returned a partial set (truncated)."
+        self._show_status(note)
 
     def _view_tensor(self, source_id: str, tensor_id: str):
         """Add single tensor to viewer."""

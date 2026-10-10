@@ -163,14 +163,14 @@ class TestUnresolvedReason:
         )
         client.query.return_value = []
         SourceList(SimpleNamespace(client=client)).refresh()
-        sql = client.query.call_args[0][0]
+        sql = client.query.call_args_list[0][0][0]  # the listing, not the ROI sets
         assert "unresolved_reason" in sql
 
     def test_an_sdk_without_the_projector_lists_the_base_columns(self):
         client = MagicMock(spec=["query"])
         client.query.return_value = []
         SourceList(SimpleNamespace(client=client)).refresh()
-        sql = client.query.call_args[0][0]
+        sql = client.query.call_args_list[0][0][0]  # the listing, not the ROI sets
         assert "unresolved_reason" not in sql and "is_resolved" in sql
 
     def test_the_reason_is_carried_and_absent_on_an_older_server(self):
@@ -195,9 +195,78 @@ class TestWatchPending:
         )
         _watch(listing, 4)
         # a re-list on each change of the pending figure (2, 1, 0), none between
-        assert client.query.call_count == 3
+        listings = [c for c in client.query.call_args_list if "FROM sources" in c[0][0]]
+        assert len(listings) == 3
 
     def test_an_older_server_without_the_field_behaves_as_before(self):
         listing, client = _listing(["a"], [{"source_count": 1}, {"source_count": 1}])
         _watch(listing, 2)
         client.query.assert_not_called()
+
+
+class TestRoiSets:
+    """The catalog's annotation set names: read with the listing when the server
+    allows, off (None) when it does not."""
+
+    def _list(self, query):
+        from biopb_napari_widget.tensor_browser._sources import SourceList
+
+        conn = MagicMock()
+        conn.client.query.side_effect = query
+        conn.client.source_row_columns.side_effect = AttributeError
+        return SourceList(conn), conn
+
+    @staticmethod
+    def _answer(rois):
+        def query(sql, **_kw):
+            return rois if "FROM rois" in sql else []
+
+        return query
+
+    def test_sets_are_read_with_the_listing(self):
+        rows = [
+            {"array_id": "a", "set_name": "nuclei", "n": 12},
+            {"array_id": "a", "set_name": "@ome", "n": 3},
+            {"array_id": "b", "set_name": "x", "n": 1},
+        ]
+        sl, _ = self._list(self._answer(rows))
+        sl.refresh()
+        assert sl.roi_sets == {"a": {"nuclei": 12, "@ome": 3}, "b": {"x": 1}}
+
+    def test_an_older_server_turns_the_feature_off_and_is_not_asked_again(self):
+        calls = []
+
+        def query(sql, **_kw):
+            if "FROM rois" in sql:
+                calls.append(sql)
+                raise RuntimeError("SQL query references disallowed table: rois")
+            return []
+
+        sl, _ = self._list(query)
+        sl.refresh()
+        sl.refresh()
+        assert sl.roi_sets is None
+        assert len(calls) == 1  # remembered for the connection
+
+    def test_a_dropped_call_keeps_the_last_answer(self):
+        state = {"fail": False}
+
+        def query(sql, **_kw):
+            if "FROM rois" in sql:
+                if state["fail"]:
+                    raise ConnectionError("unavailable")
+                return [{"array_id": "a", "set_name": "s", "n": 1}]
+            return []
+
+        sl, _ = self._list(query)
+        sl.refresh()
+        state["fail"] = True
+        sl.refresh()
+        assert sl.roi_sets == {"a": {"s": 1}}
+
+    def test_clear_lets_a_new_connection_try_again(self):
+        sl, _ = self._list(self._answer([]))
+        sl._roi_unsupported = True
+        sl.clear()
+        sl.refresh()
+        assert sl.roi_sets == {}
