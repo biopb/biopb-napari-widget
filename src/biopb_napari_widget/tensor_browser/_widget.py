@@ -458,6 +458,11 @@ def _dir_exceeds_entry_threshold(path: str) -> bool:
     return False
 
 
+def _count(result, field: str) -> int:
+    """A count field of an add result, 0 when an older server omits it."""
+    return int(getattr(result, field, 0) or 0)
+
+
 class _AddSourceWorker(QThread):
     """Runs ``SourceList.add`` for one dropped path off the GUI thread.
 
@@ -479,9 +484,10 @@ class _AddSourceWorker(QThread):
     progress = Signal(object)  # AddSourceProgress
     done = Signal(object)  # (added, refreshed, removed, failed)
     failed = Signal(str)
-    # Offline placeholders the server passed over because `cloud` was not set;
-    # emitted after `done`, only when non-zero.
-    skipped_offline = Signal(int)
+    # What the server passed over because `cloud` was not set -- (offline
+    # placeholder files, OneDrive directories); emitted after `done`, only when
+    # either is non-zero.
+    skipped = Signal(int, int)
 
     def __init__(self, sources: SourceList, path: str, cloud: bool = False):
         super().__init__()
@@ -513,10 +519,11 @@ class _AddSourceWorker(QThread):
         removed = list(result.removed)
         failed = [(f.path, f.reason) for f in result.failed]
         self.done.emit((added, refreshed, removed, failed))
-        # An older result has no such field, which reads as nothing skipped.
-        skipped = int(getattr(result, "skipped_offline", 0) or 0)
-        if skipped and not self._cloud:
-            self.skipped_offline.emit(skipped)
+        # An older result has no such fields, which reads as nothing skipped.
+        files = _count(result, "skipped_offline")
+        dirs = _count(result, "skipped_cloud_dirs")
+        if (files or dirs) and not self._cloud:
+            self.skipped.emit(files, dirs)
 
 
 class _RemoveSourceWorker(QThread):
@@ -990,7 +997,7 @@ class TensorBrowserWidget(QWidget):
         # Dropped paths whose last add left offline files out. The name check
         # only knows OneDrive, so a re-drop of one of these is where the other
         # synced folders get asked about cloud mode. Session-only.
-        self._skipped_offline_paths: set = set()
+        self._skipped_cloud_paths: set = set()
         # In-flight dropped-branch remove worker (at most one at a time), same
         # ownership rule as the add worker.
         self._remove_worker: _RemoveSourceWorker | None = None
@@ -1504,7 +1511,7 @@ class TensorBrowserWidget(QWidget):
             return  # user declined adding from a cloud-synced folder
         # A confirmed cloud drop is the user's say-so to register the offline
         # placeholders too. Any other folder is told if the server passed some
-        # over (`_on_add_skipped_offline`) and asked about cloud mode if it is
+        # over (`_on_add_skipped`) and asked about cloud mode if it is
         # dropped again.
         cloud = _cloud_drop_warning(path) is not None or self._confirm_cloud_redrop(
             path
@@ -1519,14 +1526,14 @@ class TensorBrowserWidget(QWidget):
         folder removed and dropped again; for one still registered the server
         refuses, and that message is shown as for any failed add.
         """
-        if path not in self._skipped_offline_paths:
+        if path not in self._skipped_cloud_paths:
             return False
         name = os.path.basename(path.rstrip("/\\")) or path
         resp = QMessageBox.question(
             self,
             "Add as cloud sources?",
-            f"Offline files in “{name}” were left out the last time it was "
-            "added.\n\nAdd it as a cloud folder this time, so they are "
+            f"Offline files or OneDrive folders in “{name}” were left out the "
+            "last time it was added.\n\nAdd it as a cloud folder this time, so they are "
             "included? Opening one will download it first.",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
@@ -1592,13 +1599,13 @@ class TensorBrowserWidget(QWidget):
         worker.progress.connect(self._on_add_progress)
         worker.done.connect(self._on_add_done)
         worker.failed.connect(self._on_add_failed)
-        worker.skipped_offline.connect(
-            lambda n, p=path: self._on_add_skipped_offline(p, n)
+        worker.skipped.connect(
+            lambda files, dirs, p=path: self._on_add_skipped(p, files, dirs)
         )
         if cloud:
             # Done, not failed: a refused cloud drop is still worth asking again.
             worker.done.connect(
-                lambda _payload, p=path: self._skipped_offline_paths.discard(p)
+                lambda _payload, p=path: self._skipped_cloud_paths.discard(p)
             )
         worker.finished.connect(lambda w=worker: self._add_retain.discard(w))
         self._add_cancel_btn.setVisible(True)
@@ -1633,8 +1640,10 @@ class TensorBrowserWidget(QWidget):
         self._update_drop_hint()
         self._report_failure("Add data failed", msg)
 
-    def _on_add_skipped_offline(self, path: str, count: int):
-        """Tell the user how many offline files the drop left out.
+    def _on_add_skipped(self, path: str, files: int, dirs: int):
+        """Tell the user what the drop left out: offline files and OneDrive
+        directories (everything inside the latter is missing, and uncounted).
+        Either one makes the path a potential cloud root.
 
         Information only. Re-sending the drop with ``cloud=True`` is not an
         offer to make: once a drop has registered anything its folder is a known
@@ -1643,13 +1652,20 @@ class TensorBrowserWidget(QWidget):
         remembered, so dropping it again after removing it asks about cloud mode
         (`_confirm_cloud_redrop`).
         """
-        self._skipped_offline_paths.add(path)
+        self._skipped_cloud_paths.add(path)
         name = os.path.basename(path.rstrip("/\\")) or path
+        parts = []
+        if files:
+            parts.append(
+                f"{files} offline file{'' if files == 1 else 's'} (their contents "
+                "are not on this PC)"
+            )
+        if dirs:
+            parts.append(f"{dirs} OneDrive folder{'' if dirs == 1 else 's'}")
         QMessageBox.information(
             self,
             "Some files were not added",
-            f"{count} offline file{'' if count == 1 else 's'} in “{name}” "
-            "were left out: their contents are not on this PC.\n\n"
+            f"{' and '.join(parts)} in “{name}” were left out.\n\n"
             "To include them, remove the folder and drop it again.",
         )
 
