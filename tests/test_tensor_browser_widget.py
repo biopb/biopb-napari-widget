@@ -1777,11 +1777,14 @@ class TestExpandState:
         w._build_and_display_tree()
         assert not self._folders(w)[target].isExpanded()
 
-    def test_watcher_rebuild_keeps_the_scroll_position(self, widget):
+    def test_watcher_rebuild_keeps_the_scroll_position_despite_a_selection(
+        self, widget
+    ):
         w, _, _ = widget
         self._populate(w)
         w._conn.client = MagicMock()  # connected
         w._connecting = False
+        w._selected_source_id = "s0"  # off-screen once scrolled to the end
         bar = w._tree_widget.verticalScrollBar()
         w._tree_widget.setStyleSheet("")  # drop the 300px min-height
         w._tree_widget.setFixedHeight(60)

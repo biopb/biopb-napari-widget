@@ -1853,11 +1853,7 @@ class TensorBrowserWidget(QWidget):
         if not self._connected or self._connecting:
             return
         self._clear_error()
-        # The rebuild is not the user's doing, so it must not move their view.
-        scroll = self._tree_widget.verticalScrollBar()
-        pos = scroll.value()
         self._apply_filter()
-        scroll.setValue(pos)
 
     def closeEvent(self, event):
         """Stop the watcher; the list is this widget's alone."""
@@ -1868,6 +1864,13 @@ class TensorBrowserWidget(QWidget):
 
     def _build_and_display_tree(self, filtered_ids: Set[str] | None = None):
         """Build tree from sources and display in widget."""
+        # A rebuild of the same view (the watcher re-listing, a refresh) must
+        # not move it; a different view (a new search) starts at the selection.
+        view_key = self._filter_input.text().strip().lower()
+        keep_view = view_key == getattr(self, "_view_key", None)
+        self._view_key = view_key
+        scroll = self._tree_widget.verticalScrollBar()
+        scroll_pos = scroll.value()
         self._tree_widget.clear()
 
         if not self._sources:
@@ -1912,7 +1915,12 @@ class TensorBrowserWidget(QWidget):
         # Restore the highlighted item: the tree is cleared and rebuilt on every
         # filter/refresh, which drops Qt's current-item even though we still track
         # the logical selection (issue #191).
-        self._restore_selection()
+        self._restore_selection(scroll_to=not keep_view)
+        if keep_view:
+            # Layout is lazy; without it the scroll range is still empty and
+            # the value would clamp to the top.
+            self._tree_widget.doItemsLayout()
+            scroll.setValue(scroll_pos)
 
     def _add_tree_node(self, parent, node: _TreeNode):
         """Add a tree node to the widget."""
@@ -2085,7 +2093,7 @@ class TensorBrowserWidget(QWidget):
         for i in range(self._tree_widget.topLevelItemCount()):
             restore_recursive(self._tree_widget.topLevelItem(i))
 
-    def _restore_selection(self):
+    def _restore_selection(self, scroll_to: bool = True):
         """Re-highlight the tracked source/tensor in a freshly rebuilt tree.
 
         Walk the new items, find the one matching ``_selected_source_id`` (and the
@@ -2126,7 +2134,8 @@ class TensorBrowserWidget(QWidget):
         target = target_tensor or target_source
         if target is not None:
             self._tree_widget.setCurrentItem(target)
-            self._tree_widget.scrollToItem(target)
+            if scroll_to:
+                self._tree_widget.scrollToItem(target)
 
     def _on_tree_item_clicked(self, item: QTreeWidgetItem, _column: int):
         """Handle tree item click."""
