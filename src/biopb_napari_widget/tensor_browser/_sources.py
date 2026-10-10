@@ -132,7 +132,10 @@ class SourceList:
                 client.query(_ROI_SETS_SQL, format="records")
             )
         except Exception as exc:  # noqa: BLE001 - the listing must not fail on this
-            if "rois" in str(exc).lower():
+            # The server's refusal of a table that is not on its SQL surface
+            # (an older server, or annotations off): not a transient failure.
+            message = str(exc).lower()
+            if "disallowed table" in message and "rois" in message:
                 logger.info("Server has no queryable rois table; ROI loading is off")
                 self._roi_unsupported = True
                 self.roi_sets = None

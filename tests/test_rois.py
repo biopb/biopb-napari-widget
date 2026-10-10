@@ -113,6 +113,20 @@ class TestLayers:
             ("shapes", "s (shapes)"),
         ]
 
+    def test_a_set_keeps_its_colour_however_it_is_loaded(self):
+        # Chosen from the name, not the position in a result: loading two sets one
+        # after the other must still tell them apart.
+        a1 = one(roi_layer_specs([pt(1, 1, set_name="a")], YX)).kwargs["face_color"]
+        a2 = one(
+            roi_layer_specs([pt(1, 1, set_name="a"), pt(2, 2, set_name="b")], YX)[:1]
+        ).kwargs["face_color"]
+        assert a1 == a2
+        colours = {
+            one(roi_layer_specs([pt(1, 1, set_name=n)], YX)).kwargs["face_color"]
+            for n in ("nuclei", "cells", "vessels", "foci", "x", "y")
+        }
+        assert len(colours) > 1
+
     def test_one_family_keeps_the_set_name(self):
         assert one(roi_layer_specs([pt(1, 1)], YX)).name == "s"
 
@@ -139,12 +153,12 @@ class TestPlanes:
     def test_unpinned_on_a_stack_is_a_2d_layer_napari_broadcasts(self):
         spec = one(roi_layer_specs([pt(5, 7)], ZYX))
         assert np.asarray(spec.data).shape == (1, 2)
-        assert list(spec.axes) == [1, 2]
+        assert spec.dim_labels == ["y", "x"]
 
     def test_pinned_axis_becomes_a_leading_coordinate(self):
         spec = one(roi_layer_specs([pt(5, 7, plane={0: 4})], ZYX))
         assert np.allclose(spec.data, [[4, 7, 5]])
-        assert list(spec.axes) == [0, 1, 2]
+        assert spec.dim_labels == ["z", "y", "x"]
 
     def test_layer_spans_from_the_earliest_pinned_axis(self):
         spec = one(roi_layer_specs([pt(5, 7, plane={0: 2, 1: 4})], CZYX))
@@ -174,7 +188,7 @@ class TestPlanes:
         rgb = desc((10, 100, 200, 3), ["z", "y", "x", "s"])
         spec = one(roi_layer_specs([pt(5, 7, plane={0: 1})], rgb))
         assert np.allclose(spec.data, [[1, 7, 5]])
-        assert list(spec.axes) == [0, 1, 2]
+        assert spec.dim_labels == ["z", "y", "x"]
 
     def test_a_pin_on_y_x_or_out_of_range_is_ignored(self):
         spec = one(roi_layer_specs([pt(5, 7, plane={1: 5, 2: 5, 9: 1})], ZYX))
@@ -218,8 +232,10 @@ class TestAdd:
         )
         points, shapes = specs
         kw = {k: v for k, v in points.kwargs.items() if k != "metadata"}
-        layer = Points(np.asarray(points.data, dtype=float), **kw)
+        layer = Points(np.asarray(points.data, dtype=float), name=points.name, **kw)
         assert layer.ndim == 3 and list(layer.features["roi_id"]) == ["r"]
         kw = {k: v for k, v in shapes.kwargs.items() if k != "metadata"}
-        layer = Shapes([np.asarray(d, dtype=float) for d in shapes.data], **kw)
+        layer = Shapes(
+            [np.asarray(d, dtype=float) for d in shapes.data], name=shapes.name, **kw
+        )
         assert layer.ndim == 3 and layer.nshapes == 1

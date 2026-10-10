@@ -1529,6 +1529,7 @@ class TestRoiAnnotations:
         from qtpy.QtWidgets import QMenu
 
         w._list.roi_sets = sets
+        w._list.sources = {"a": _source("a", tensors=["a"])}
         # Held on the test so the C++ menu (and its actions) outlive this call:
         # a collected QMenu leaves its actions dangling, which crashes Windows
         # and macOS Qt rather than failing.
@@ -1563,6 +1564,7 @@ class TestRoiAnnotations:
         from biopb_napari_widget.tensor_browser import _widget as widget_mod
 
         w, _, _ = widget
+        w._list.sources = {"a": _source("a", tensors=["a"])}
         w._conn.client = MagicMock()
         started = []
         monkeypatch.setattr(
@@ -1575,56 +1577,94 @@ class TestRoiAnnotations:
         menu.actions()[0].menu().actions()[1].trigger()  # menu stays referenced
         assert len(started) == 1 and started[0]._set_name == "y"
 
-    def test_worker_fetches_by_array_id_and_set(self, qapp):
+    def test_the_worker_fetches_the_set_and_builds_the_specs(self, qapp, monkeypatch):
+        from biopb.image import ROI, Point, RoiAnnotation
+
+        from biopb_napari_widget.tensor_browser import _widget as widget_mod
+
+        client = MagicMock()
+        client.list_rois.return_value = MagicMock(
+            rois=[
+                RoiAnnotation(
+                    roi_id="r", set_name="@ome", roi=ROI(point=Point(x=1.0, y=2.0))
+                )
+            ],
+            truncated=True,
+        )
+        monkeypatch.setattr(widget_mod, "image_scale", lambda *a: [1.0, 1.0])
+        desc = _source("a", tensors=["a"]).tensors[0]
+        got = []
+        worker = widget_mod._RoiWorker(client, "a", desc, "@ome")
+        worker.done.connect(lambda *a: got.append(a))
+        worker.run()
+        client.list_rois.assert_called_once_with("a", "@ome")
+        ((name, specs, truncated),) = got
+        assert name == "@ome" and truncated is True
+        assert [s.kind for s in specs] == ["points"]
+
+    def test_an_empty_set_gives_no_specs_and_no_scale_call(self, qapp, monkeypatch):
+        from biopb_napari_widget.tensor_browser import _widget as widget_mod
+
+        client = MagicMock()
+        client.list_rois.return_value = MagicMock(rois=[], truncated=False)
+        monkeypatch.setattr(
+            widget_mod,
+            "image_scale",
+            lambda *a: pytest.fail("no ROIs, no scale"),
+        )
+        desc = _source("a", tensors=["a"]).tensors[0]
+        got = []
+        worker = widget_mod._RoiWorker(client, "a", desc, "s")
+        worker.done.connect(lambda *a: got.append(a))
+        worker.run()
+        assert got == [("s", [], False)]
+
+    def test_a_fetch_error_is_reported(self, qapp):
         from biopb_napari_widget.tensor_browser._widget import _RoiWorker
 
         client = MagicMock()
-        got = []
-        worker = _RoiWorker(client, "arr", "@ome")
-        worker.done.connect(got.append)
+        client.list_rois.side_effect = RuntimeError("boom")
+        desc = _source("a", tensors=["a"]).tensors[0]
+        failed = []
+        worker = _RoiWorker(client, "a", desc, "s")
+        worker.failed.connect(failed.append)
         worker.run()
-        client.list_rois.assert_called_once_with("arr", "@ome")
-        assert len(got) == 1
+        assert failed == ["boom"]
 
-    def _result(self, n=3, truncated=False):
+    def _specs(self, n=3):
         from biopb.image import ROI, Point, RoiAnnotation
+
+        from biopb_napari_widget._rois import roi_layer_specs
 
         rois = [
             RoiAnnotation(
                 roi_id=f"r{i}",
-                array_id="a",
                 set_name="nuclei",
-                label="L",
                 roi=ROI(point=Point(x=i + 1.0, y=2.0)),
             )
             for i in range(n)
         ]
-        return MagicMock(rois=rois, truncated=truncated)
+        return roi_layer_specs(rois, _source("a", tensors=["a"]).tensors[0])
 
-    def _fetched(self, w, result):
-        w._list.sources = {"a": _source("a", tensors=["a"])}
-        w._conn.client = MagicMock()
-        w._conn.client.get_physical_scale.return_value = None
-        w._report_failure = MagicMock()
-        w._show_message = MagicMock()
-        w._on_rois_fetched("a", "a", "nuclei", result)
-
-    def test_a_fetched_set_becomes_a_layer(self, widget):
+    def test_fetched_specs_become_layers(self, widget):
         w, _, _ = widget
-        self._fetched(w, self._result())
+        w._show_status = MagicMock()
+        w._on_rois_fetched("nuclei", self._specs(), False)
         w._viewer.add_points.assert_called_once()
         assert w._viewer.add_points.call_args.kwargs["name"] == "nuclei"
 
     def test_an_empty_set_says_so(self, widget):
         w, _, _ = widget
-        self._fetched(w, self._result(n=0))
+        w._show_status = MagicMock()
+        w._on_rois_fetched("nuclei", [], False)
         w._viewer.add_points.assert_not_called()
-        assert "empty" in w._show_message.call_args.args[0]
+        assert "empty" in w._show_status.call_args.args[0]
 
     def test_truncation_is_reported(self, widget):
         w, _, _ = widget
-        self._fetched(w, self._result(truncated=True))
-        assert "truncated" in w._show_message.call_args.args[0]
+        w._show_status = MagicMock()
+        w._on_rois_fetched("nuclei", self._specs(), True)
+        assert "truncated" in w._show_status.call_args.args[0]
 
     def test_a_failure_to_fetch_is_reported(self, widget):
         w, _, _ = widget
