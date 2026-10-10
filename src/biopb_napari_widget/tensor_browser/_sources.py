@@ -47,6 +47,22 @@ def _sources_sql(client) -> str:
     return f"SELECT {columns} FROM sources ORDER BY source_id"
 
 
+#: One row per (tensor, set): what annotations the server holds. Reserved
+#: (``@``) sets are in it -- the SQL surface does not hide them the way an
+#: unqualified ``list_rois`` does.
+_ROI_SETS_SQL = (
+    "SELECT array_id, set_name, count(*) AS n FROM rois GROUP BY array_id, set_name"
+)
+
+
+def roi_sets_from_rows(rows) -> Dict[str, Dict[str, int]]:
+    """``{array_id: {set_name: count}}`` from the ``rois`` aggregate rows."""
+    out: Dict[str, Dict[str, int]] = {}
+    for row in rows:
+        out.setdefault(row["array_id"], {})[row["set_name"]] = int(row["n"])
+    return out
+
+
 def _accepts_cloud(register) -> bool:
     try:
         params = inspect.signature(register).parameters
@@ -63,6 +79,13 @@ class SourceList:
     def __init__(self, connection) -> None:
         self._conn = connection
         self.sources: Dict[str, CatalogSource] = {}
+        #: Which annotation sets each tensor has, ``{array_id: {set: count}}``,
+        #: or ``None`` when the server has no queryable ``rois`` table (an older
+        #: server, or annotations switched off) -- the ROI feature is then off.
+        #: Re-read with the listing, so it is as current as the tree; another
+        #: client's new annotations show on the next refresh.
+        self.roi_sets: Dict[str, Dict[str, int]] | None = None
+        self._roi_unsupported = False
         # The last health answer, so the paint thread can tell "still indexing"
         # from "empty" without a round trip.
         self.last_health: dict | None = None
@@ -83,6 +106,8 @@ class SourceList:
 
     def clear(self) -> None:
         self.sources = {}
+        self.roi_sets = None
+        self._roi_unsupported = False  # a new connection may be a newer server
         self.last_health = None
 
     def refresh(self) -> Dict[str, CatalogSource]:
@@ -90,7 +115,29 @@ class SourceList:
         client = self._client()
         rows = client.query(_sources_sql(client), format="records")
         self.sources = {s.source_id: s for s in sources_from_rows(rows)}
+        self._refresh_roi_sets(client)
         return self.sources
+
+    def _refresh_roi_sets(self, client) -> None:
+        """Read which sets each tensor has, if the server will say.
+
+        A server without the table refuses the query; that is remembered for the
+        connection rather than retried at every re-list. Any other failure (a
+        dropped call) keeps the last answer and is tried again next time.
+        """
+        if self._roi_unsupported:
+            return
+        try:
+            self.roi_sets = roi_sets_from_rows(
+                client.query(_ROI_SETS_SQL, format="records")
+            )
+        except Exception as exc:  # noqa: BLE001 - the listing must not fail on this
+            if "rois" in str(exc).lower():
+                logger.info("Server has no queryable rois table; ROI loading is off")
+                self._roi_unsupported = True
+                self.roi_sets = None
+            else:
+                logger.debug("Reading the ROI sets failed", exc_info=True)
 
     def update_health(self) -> dict | None:
         """Ask the server how it is; kept for :meth:`scan_in_progress`."""

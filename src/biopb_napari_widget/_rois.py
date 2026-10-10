@@ -58,15 +58,6 @@ def roi_set_name(roi) -> str:
     return roi.set_name or _DEFAULT_SET
 
 
-def sets_in(rois) -> Dict[str, int]:
-    """Annotation count per set, in first-seen order."""
-    counts: Dict[str, int] = {}
-    for roi in rois:
-        name = roi_set_name(roi)
-        counts[name] = counts.get(name, 0) + 1
-    return counts
-
-
 def _arm(roi) -> str | None:
     try:
         return roi.roi.WhichOneof("shape")
@@ -119,25 +110,21 @@ def roi_layer_specs(
     tensor_desc,
     *,
     scale: Sequence[float] | None = None,
-    only_sets: Sequence[str] | None = None,
 ) -> List[RoiLayerSpec]:
     """The layers *rois* become on the image *tensor_desc* describes.
 
     *scale* is the image layer's scale vector (one entry per non-samples axis);
-    each layer takes the trailing slice that matches its axes. *only_sets*
-    restricts to those set names.
+    each layer takes the trailing slice that matches its axes.
     """
     shape = list(tensor_desc.shape)
     _, _, _, s_idx = _resolve_axes(shape, tensor_desc.dim_labels)
     n_axes = len(shape) - (1 if s_idx is not None else 0)
     n_lead = n_axes - 2  # every axis ahead of Y, X
-    wanted = set(only_sets) if only_sets is not None else None
 
     by_set: Dict[str, list] = {}
     for roi in rois:
         name = roi_set_name(roi)
-        if wanted is None or name in wanted:
-            by_set.setdefault(name, []).append(roi)
+        by_set.setdefault(name, []).append(roi)
 
     labels = canonical_dim_labels(tensor_desc)
     specs: List[RoiLayerSpec] = []

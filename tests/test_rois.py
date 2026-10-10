@@ -12,7 +12,6 @@ from biopb_napari_widget._rois import (
     MAX_REPEATED_VERTICES,
     add_roi_layers,
     roi_layer_specs,
-    sets_in,
 )
 
 
@@ -124,10 +123,6 @@ class TestLayers:
     def test_empty_set_name_is_default(self):
         assert one(roi_layer_specs([pt(1, 1, set_name="")], YX)).name == "default"
 
-    def test_only_sets_restricts(self):
-        rois = [pt(1, 1, set_name="a"), pt(2, 2, set_name="b")]
-        assert [s.name for s in roi_layer_specs(rois, YX, only_sets=["b"])] == ["b"]
-
     def test_label_and_roi_id_are_kept_as_features(self):
         spec = one(roi_layer_specs([pt(1, 1, label="focus", roi_id="r1")], YX))
         assert list(spec.kwargs["features"]["label"]) == ["focus"]
@@ -138,10 +133,6 @@ class TestLayers:
     def test_masks_and_meshes_are_skipped(self):
         empty = ann(ROI())
         assert roi_layer_specs([empty], YX) == []
-
-    def test_sets_in_counts_in_first_seen_order(self):
-        rois = [pt(1, 1, set_name="b"), pt(1, 1, set_name="a"), pt(2, 2, set_name="b")]
-        assert sets_in(rois) == {"b": 2, "a": 1}
 
 
 class TestPlanes:

@@ -22,13 +22,10 @@ from qtpy.QtGui import QColor, QFont, QFontMetrics, QIcon, QPainter, QPalette, Q
 from qtpy.QtWidgets import (
     QApplication,
     QDialog,
-    QDialogButtonBox,
     QHBoxLayout,
     QHeaderView,
     QLabel,
     QLineEdit,
-    QListWidget,
-    QListWidgetItem,
     QMenu,
     QMessageBox,
     QProgressDialog,
@@ -46,7 +43,7 @@ from qtpy.QtWidgets import (
 
 from .._catalog import CatalogSource
 from .._labels import split_label_array_id
-from .._rois import add_roi_layers, roi_layer_specs, sets_in
+from .._rois import add_roi_layers, roi_layer_specs
 from .._tensor_utils import _resolve_axes, add_tensor_layer, build_layer_scale
 from .._urls import is_local_url
 from ._sources import SourceList
@@ -522,57 +519,24 @@ class _SearchWorker(QThread):
 
 
 class _RoiWorker(QThread):
-    """Fetches a tensor's ROI annotations off the GUI thread.
-
-    One round trip: the answer carries every set with its count, so the sets
-    on offer are known without a second query.
-    """
+    """Fetches one annotation set of a tensor off the GUI thread."""
 
     done = Signal(object)  # RoiListResult
     failed = Signal(str)
 
-    def __init__(self, client, array_id: str):
+    def __init__(self, client, array_id: str, set_name: str):
         super().__init__()
         self._client = client
         self._array_id = array_id
+        self._set_name = set_name
 
     def run(self):
         try:
-            result = self._client.list_rois(self._array_id)
+            result = self._client.list_rois(self._array_id, self._set_name)
         except Exception as exc:  # surface the SDK/server message to the user
             self.failed.emit(str(exc))
             return
         self.done.emit(result)
-
-
-def _ask_roi_sets(parent, counts: Dict[str, int]) -> List[str] | None:
-    """Which of the annotation sets to load: a checklist, every set checked.
-    ``None`` when cancelled. Not asked for a single set -- that was the request."""
-    dialog = QDialog(parent)
-    dialog.setWindowTitle("Load ROI annotations")
-    layout = QVBoxLayout(dialog)
-    layout.addWidget(QLabel("This image has several annotation sets. Load:"))
-    listing = QListWidget()
-    for name, n in counts.items():
-        item = QListWidgetItem(f"{name}  ({n:,})")
-        item.setData(Qt.ItemDataRole.UserRole, name)
-        item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-        item.setCheckState(Qt.CheckState.Checked)
-        listing.addItem(item)
-    layout.addWidget(listing)
-    buttons = QDialogButtonBox(
-        QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
-    )
-    buttons.accepted.connect(dialog.accept)
-    buttons.rejected.connect(dialog.reject)
-    layout.addWidget(buttons)
-    if dialog.exec_() != QDialog.Accepted:
-        return None
-    return [
-        listing.item(i).data(Qt.ItemDataRole.UserRole)
-        for i in range(listing.count())
-        if listing.item(i).checkState() == Qt.CheckState.Checked
-    ]
 
 
 def _count(result, field: str) -> int:
@@ -2271,15 +2235,16 @@ class TensorBrowserWidget(QWidget):
             else:
                 view_action.setEnabled(False)
 
-        # ROI annotations: only on request, because they are a round trip the
-        # catalog does not carry. Image tensors only -- a label set has none.
+        # ROI annotations: the sets a tensor has come from the catalog, so the
+        # entry is built from what is there and nothing is fetched until one is
+        # picked. Absent when the server cannot say (no queryable rois table),
+        # and for a label set, which has none.
         if (
             tensor_id
             and not is_unresolved_source
             and split_label_array_id(tensor_id) is None
         ):
-            roi_action = menu.addAction("Load ROI annotations…")
-            roi_action.triggered.connect(lambda: self._load_rois(source_id, tensor_id))
+            self._add_roi_actions(menu, source_id, tensor_id)
 
         # Metadata action
         meta_action = menu.addAction("Metadata")
@@ -2396,17 +2361,44 @@ class TensorBrowserWidget(QWidget):
         # delivered inside this exec_, so a fast finish can't deadlock.
         progress.exec_()
 
-    def _load_rois(self, source_id: str, tensor_id: str):
-        """Fetch the tensor's ROI annotations, then add the sets the user picks as
-        Points / Shapes layers."""
+    def _add_roi_actions(self, menu, source_id: str, tensor_id: str):
+        """ "Load ROI annotations" for a tensor: one entry for a single set, a
+        submenu with one entry per set for several. A reserved (``@``) set is the
+        server's own -- read-only -- and says so."""
+        sets = (self._list.roi_sets or {}).get(tensor_id)
+        if not sets:
+            return
+
+        def label(name: str, count: int) -> str:
+            tag = "  (read-only)" if name.startswith("@") else ""
+            return f"{name}{tag}  ({count:,})"
+
+        if len(sets) == 1:
+            ((name, count),) = sets.items()
+            action = menu.addAction(f"Load ROI annotations: {label(name, count)}")
+            action.triggered.connect(
+                lambda _=False, n=name: self._load_rois(source_id, tensor_id, n)
+            )
+            return
+        sub = menu.addMenu("Load ROI annotations")
+        for name, count in sorted(sets.items()):
+            action = sub.addAction(label(name, count))
+            action.triggered.connect(
+                lambda _=False, n=name: self._load_rois(source_id, tensor_id, n)
+            )
+
+    def _load_rois(self, source_id: str, tensor_id: str, set_name: str):
+        """Fetch one annotation set, then add it as Points / Shapes layers."""
         if not self._client:
             return
         self._clear_error()
         QApplication.setOverrideCursor(Qt.BusyCursor)
-        worker = _RoiWorker(self._client, tensor_id)
+        worker = _RoiWorker(self._client, tensor_id, set_name)
         self._roi_retain.add(worker)
         worker.done.connect(
-            lambda result, s=source_id, t=tensor_id: self._on_rois_fetched(s, t, result)
+            lambda result, s=source_id, t=tensor_id, n=set_name: self._on_rois_fetched(
+                s, t, n, result
+            )
         )
         worker.failed.connect(self._on_rois_failed)
         worker.finished.connect(lambda w=worker: self._roi_retain.discard(w))
@@ -2416,20 +2408,14 @@ class TensorBrowserWidget(QWidget):
         QApplication.restoreOverrideCursor()
         self._report_failure("Could not load ROI annotations", message)
 
-    def _on_rois_fetched(self, source_id: str, tensor_id: str, result):
+    def _on_rois_fetched(self, source_id: str, tensor_id: str, set_name: str, result):
         QApplication.restoreOverrideCursor()
         rois = list(result.rois)
-        counts = sets_in(rois)
-        if not counts:
+        if not rois:
             self._show_message(
-                "This image has no ROI annotations.", level="info", sticky=False
+                f"ROI set “{set_name}” is empty.", level="info", sticky=False
             )
             return
-        chosen = list(counts)
-        if len(counts) > 1:
-            chosen = _ask_roi_sets(self, counts)
-            if not chosen:
-                return
         src = self._sources.get(source_id)
         tensor_desc = next(
             (t for t in (src.tensors if src else ()) if t.array_id == tensor_id), None
@@ -2447,7 +2433,7 @@ class TensorBrowserWidget(QWidget):
                 tensor_desc=tensor_desc,
                 rgb=s_idx is not None,
             )
-            specs = roi_layer_specs(rois, tensor_desc, scale=scale, only_sets=chosen)
+            specs = roi_layer_specs(rois, tensor_desc, scale=scale)
             layers = add_roi_layers(self._viewer, specs)
         except Exception as exc:
             logger.exception("Failed to add ROI layers")
