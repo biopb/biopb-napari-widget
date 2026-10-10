@@ -592,7 +592,7 @@ class TestRowShape:
 
 class TestCloudGlyph:
     """A `needs_recall` source row carries a cloud glyph; every source row has
-    the same icon slot so the names stay aligned."""
+    the glyph slot so the names stay aligned."""
 
     def _row(self, w, name, **kw):
         from biopb_napari_widget.tensor_browser._widget import _TreeNode
@@ -618,20 +618,19 @@ class TestCloudGlyph:
         assert "indexed" in pending.toolTip(0)
         assert "indexed" not in cloud.toolTip(0)
 
-    def test_icon_slot_is_the_same_size_for_every_source_row(self, widget):
+    def test_glyph_rides_in_the_triangle_slot_not_an_icon(self, widget):
+        from biopb_napari_widget.tensor_browser._widget import _GLYPH_ROLE
+
         w, _, _ = widget
         cloud = self._row(w, "a", unresolved_reason="needs_recall")
         pending = self._row(w, "c", unresolved_reason="pending")
-        plain = self._row(w, "d", unresolved_reason="failed")  # no glyph
-        rows = (cloud, pending, plain)
-        size = lambda it: it.icon(0).availableSizes()[0]  # noqa: E731
-        assert all(not r.icon(0).isNull() for r in rows)
-        assert size(cloud) == size(pending) == size(plain)
-        # Only the plain row's slot is blank; a glyph draws something. (The two
-        # glyphs are not compared with each other: a font may lack either.)
-        image = lambda it: it.icon(0).pixmap(size(it)).toImage()  # noqa: E731
-        assert image(cloud) != image(plain)
-        assert image(pending) != image(plain)
+        plain = self._row(w, "d", unresolved_reason="failed")
+        assert cloud.data(0, _GLYPH_ROLE)
+        assert pending.data(0, _GLYPH_ROLE)
+        assert cloud.data(0, _GLYPH_ROLE) != pending.data(0, _GLYPH_ROLE)
+        assert not plain.data(0, _GLYPH_ROLE)
+        # No icon, so no extra width between the branch area and the text.
+        assert all(r.icon(0).isNull() for r in (cloud, pending, plain))
 
     def test_glyph_gone_after_resolve(self, widget):
         w, _, _ = widget

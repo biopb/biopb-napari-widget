@@ -17,8 +17,8 @@ from typing import TYPE_CHECKING, Dict, List, NamedTuple, Sequence, Set
 from urllib.parse import urlparse
 
 from biopb.tensor import Connection, ResolveCancelled
-from qtpy.QtCore import QSize, Qt, QThread, QTimer, Signal
-from qtpy.QtGui import QColor, QFont, QFontMetrics, QIcon, QPainter, QPalette, QPixmap
+from qtpy.QtCore import QRect, Qt, QThread, QTimer, Signal
+from qtpy.QtGui import QColor, QFont, QFontMetrics, QPalette
 from qtpy.QtWidgets import (
     QApplication,
     QDialog,
@@ -147,7 +147,6 @@ _CLOUD_TOOLTIP = "Cloud file, not downloaded. Resolving it downloads the whole f
 #: Marks a source the server is still indexing in the background.
 _PENDING_GLYPH = "\u22ef"
 _PENDING_TOOLTIP = "Being indexed in the background."
-_GLYPH_W, _GLYPH_H = 26, 16
 
 
 def _format_shape(shape: List[int]) -> str:
@@ -169,10 +168,40 @@ def _row_shape(shape: List[int]) -> str:
 _SUFFIX_ROLE = Qt.ItemDataRole.UserRole + 3
 
 
-class _SuffixDelegate(QStyledItemDelegate):
-    """Draws a row's name as usual and its suffix after it, smaller and grey.
+#: Item data role holding a row's status glyph (cloud / pending), drawn by
+#: ``_GlyphTree`` in the slot the expand triangle would take.
+_GLYPH_ROLE = Qt.ItemDataRole.UserRole + 4
 
-    The name elides first, so the suffix stays readable on a narrow panel.
+
+class _GlyphTree(QTreeWidget):
+    """A tree that draws a row's status glyph where its expand triangle goes.
+
+    Only childless rows carry a glyph, so it never competes with a triangle and
+    costs no extra width.
+    """
+
+    def drawBranches(self, painter, rect, index):
+        glyph = index.data(_GLYPH_ROLE)
+        if not glyph:
+            super().drawBranches(painter, rect, index)
+            return
+        w = self.indentation()
+        slot = QRect(rect.right() - w + 1, rect.top(), w, rect.height())
+        painter.save()
+        painter.setPen(QColor(self.palette().color(self.foregroundRole())))
+        font = QFont(painter.font())
+        font.setBold(True)
+        painter.setFont(font)
+        painter.drawText(slot, Qt.AlignmentFlag.AlignCenter, glyph)
+        painter.restore()
+
+
+class _SuffixDelegate(QStyledItemDelegate):
+    """Draws a row's name as usual and its suffix right-aligned, smaller and grey.
+
+    The name elides first and the suffix is always drawn, so every row of a
+    panel shows (or lacks) its suffix for the same reason -- never because this
+    row's name happened to be long.
     """
 
     _GAP = 8
@@ -200,7 +229,7 @@ class _SuffixDelegate(QStyledItemDelegate):
         else:
             small.setPixelSize(max(1, round(small.pixelSize() * 0.85)))
         suffix_w = QFontMetrics(small).horizontalAdvance(suffix)
-        name_w = max(rect.width() - suffix_w - self._GAP, rect.width() // 2)
+        name_w = max(rect.width() - suffix_w - self._GAP, 0)
         elided = QFontMetrics(opt.font).elidedText(
             name, Qt.TextElideMode.ElideRight, name_w
         )
@@ -220,15 +249,13 @@ class _SuffixDelegate(QStyledItemDelegate):
         painter.drawText(
             rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, elided
         )
-        x = rect.left() + QFontMetrics(opt.font).horizontalAdvance(elided) + self._GAP
-        if x + suffix_w <= rect.right() + 1:
-            painter.setFont(small)
-            painter.setPen(grey)
-            painter.drawText(
-                rect.adjusted(x - rect.left(), 0, 0, 0),
-                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-                suffix,
-            )
+        painter.setFont(small)
+        painter.setPen(grey)
+        painter.drawText(
+            rect,
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+            suffix,
+        )
         painter.restore()
 
 
@@ -1193,7 +1220,7 @@ class TensorBrowserWidget(QWidget):
         self._filter_timer.timeout.connect(self._apply_filter)
 
         # Tree widget - give it most of the space
-        self._tree_widget = QTreeWidget()
+        self._tree_widget = _GlyphTree()
         self._tree_widget.setHeaderHidden(True)
         # Column 0 holds the name/tree; a narrow column 1 holds the remove [x]
         # button on drag-dropped root rows only (empty, zero-width otherwise).
@@ -1204,7 +1231,6 @@ class TensorBrowserWidget(QWidget):
         _header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self._tree_widget.setExpandsOnDoubleClick(False)
         self._tree_widget.setIndentation(12)
-        self._tree_widget.setIconSize(QSize(_GLYPH_W, _GLYPH_H))
         self._tree_widget.setItemDelegateForColumn(
             0, _SuffixDelegate(self._tree_widget)
         )
@@ -1880,28 +1906,6 @@ class TensorBrowserWidget(QWidget):
         # the logical selection (issue #191).
         self._restore_selection()
 
-    def _glyph_icon(self, glyph: str) -> QIcon:
-        """A fixed-size icon drawing *glyph* ("" gives a transparent one), so a
-        row with the glyph and a row without it keep their text aligned."""
-        cache = self.__dict__.setdefault("_glyph_icons", {})
-        if glyph not in cache:
-            pix = QPixmap(_GLYPH_W, _GLYPH_H)
-            pix.fill(Qt.GlobalColor.transparent)
-            if glyph:
-                painter = QPainter(pix)
-                font = QFont(painter.font())
-                font.setPixelSize(_GLYPH_H)
-                font.setBold(True)
-                painter.setFont(font)
-                color = self._tree_widget.palette().color(
-                    self._tree_widget.foregroundRole()
-                )
-                painter.setPen(QColor(color))
-                painter.drawText(pix.rect(), Qt.AlignmentFlag.AlignCenter, glyph)
-                painter.end()
-            cache[glyph] = QIcon(pix)
-        return cache[glyph]
-
     def _add_tree_node(self, parent, node: _TreeNode):
         """Add a tree node to the widget."""
         item = QTreeWidgetItem(parent)
@@ -1948,14 +1952,14 @@ class TensorBrowserWidget(QWidget):
             # full label -- which elides when it outgrows the panel -- is only
             # readable on hover.
             item.setToolTip(0, display_name)
-            # Every source row gets an icon slot, blank unless it is a cloud
-            # placeholder or still indexing, so the names stay aligned.
+            # A cloud placeholder or still-indexing source (never expandable)
+            # shows its glyph in the triangle's slot.
             glyph, note = "", ""
             if _needs_recall(src):
                 glyph, note = _CLOUD_GLYPH, _CLOUD_TOOLTIP
             elif _is_unresolved(src) and src.unresolved_reason == "pending":
                 glyph, note = _PENDING_GLYPH, _PENDING_TOOLTIP
-            item.setIcon(0, self._glyph_icon(glyph))
+            item.setData(0, _GLYPH_ROLE, glyph)
             if note:
                 item.setToolTip(0, f"{display_name}\n{note}")
 
