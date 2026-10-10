@@ -1518,3 +1518,113 @@ class TestSearch:
         opened = w._expanded_folders
         assert opened == {"/lab/exp1"}
         assert not any(r.startswith("n.tif") for r in self._rows(w))
+
+
+class TestRoiAnnotations:
+    """'Load ROI annotations…' fetches on request, asks which sets only when there
+    are several, and adds Points / Shapes layers."""
+
+    def _result(self, *sets, truncated=False):
+        from biopb.image import ROI, Point, RoiAnnotation
+
+        rois = [
+            RoiAnnotation(
+                roi_id=f"{name}{i}",
+                array_id="a",
+                set_name=name,
+                label="L",
+                roi=ROI(point=Point(x=i + 1.0, y=2.0)),
+            )
+            for name, n in sets
+            for i in range(n)
+        ]
+        return MagicMock(rois=rois, truncated=truncated)
+
+    def _fetched(self, widget, result, monkeypatch, ask=None):
+        from biopb_napari_widget.tensor_browser import _widget as widget_mod
+
+        w, _, _ = widget
+        w._list.sources = {"a": _source("a", tensors=["a"])}
+        w._conn.client = MagicMock()
+        w._conn.client.get_physical_scale.return_value = None
+        w._report_failure = MagicMock()
+        w._show_message = MagicMock()
+        if ask is not None:
+            monkeypatch.setattr(widget_mod, "_ask_roi_sets", ask)
+        else:
+            monkeypatch.setattr(
+                widget_mod,
+                "_ask_roi_sets",
+                lambda *a, **k: pytest.fail("must not ask for one set"),
+            )
+        w._on_rois_fetched("a", "a", result)
+        return w
+
+    def test_no_annotations_says_so(self, widget, monkeypatch):
+        w = self._fetched(widget, self._result(), monkeypatch)
+        w._viewer.add_points.assert_not_called()
+        assert "no ROI" in w._show_message.call_args.args[0]
+
+    def test_one_set_loads_without_asking(self, widget, monkeypatch):
+        w = self._fetched(widget, self._result(("nuclei", 3)), monkeypatch)
+        w._viewer.add_points.assert_called_once()
+        assert w._viewer.add_points.call_args.kwargs["name"] == "nuclei"
+
+    def test_several_sets_ask_and_load_only_the_chosen(self, widget, monkeypatch):
+        asked = {}
+
+        def ask(parent, counts):
+            asked.update(counts)
+            return ["b"]
+
+        w = self._fetched(
+            widget, self._result(("a", 2), ("b", 5), ("c", 1)), monkeypatch, ask=ask
+        )
+        assert asked == {"a": 2, "b": 5, "c": 1}
+        w._viewer.add_points.assert_called_once()
+        assert w._viewer.add_points.call_args.kwargs["name"] == "b"
+
+    def test_cancelling_the_choice_adds_nothing(self, widget, monkeypatch):
+        w = self._fetched(
+            widget,
+            self._result(("a", 1), ("b", 1)),
+            monkeypatch,
+            ask=lambda *a, **k: None,
+        )
+        w._viewer.add_points.assert_not_called()
+
+    def test_truncation_is_reported(self, widget, monkeypatch):
+        w = self._fetched(widget, self._result(("a", 1), truncated=True), monkeypatch)
+        assert "truncated" in w._show_message.call_args.args[0]
+
+    def test_a_failure_to_fetch_is_reported(self, widget):
+        w, _, _ = widget
+        w._report_failure = MagicMock()
+        w._on_rois_failed("annotations disabled")
+        w._report_failure.assert_called_once()
+
+    def test_load_starts_a_worker(self, widget, monkeypatch):
+        from biopb_napari_widget.tensor_browser import _widget as widget_mod
+
+        w, _, _ = widget
+        w._conn.client = MagicMock()
+        started = []
+        monkeypatch.setattr(
+            widget_mod._RoiWorker, "start", lambda self: started.append(self)
+        )
+        monkeypatch.setattr(
+            widget_mod.QApplication, "setOverrideCursor", lambda *a: None
+        )
+        w._load_rois("a", "a")
+        assert len(started) == 1
+
+    def test_worker_fetches_by_array_id(self, qapp):
+        from biopb_napari_widget.tensor_browser._widget import _RoiWorker
+
+        client = MagicMock()
+        got = []
+        worker = _RoiWorker(client, "arr")
+        worker.done.connect(got.append)
+        worker.run()
+        client.list_rois.assert_called_once_with("arr")
+        assert len(got) == 1
