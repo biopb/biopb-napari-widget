@@ -7,20 +7,14 @@ worker thread is *captured* rather than really spawned, so the test runs it
 explicitly and can assert both the in-flight ("Connecting…") and completed
 states. The connection and the source list are fakes.
 
-A real ``napari`` viewer (and thus a Qt/OpenGL context) is required, so the
-suite is skipped on macOS CI like the other viewer tests.
+The widget only stores the viewer and hands it to ``add_tensor_layer``, so a
+stand-in viewer is used: building a real napari viewer (a Qt/OpenGL window) for
+every test was slow and segfaulted intermittently inside napari on CI.
 """
 
-import os
-import sys
 from unittest.mock import MagicMock
 
 import pytest
-
-pytestmark = pytest.mark.skipif(
-    sys.platform == "darwin" and os.getenv("CI") == "true",
-    reason="OpenGL context unavailable on macOS CI headless environment",
-)
 
 
 class TestGetPathParts:
@@ -153,13 +147,13 @@ def _walk(node):
 
 
 @pytest.fixture
-def widget(make_napari_viewer, monkeypatch):
+def widget(qapp, monkeypatch):
     from qtpy.QtCore import QTimer
 
     from biopb_napari_widget.tensor_browser import _widget as widget_mod
     from biopb_napari_widget.tensor_browser._widget import TensorBrowserWidget
 
-    viewer = make_napari_viewer(show=False)
+    viewer = MagicMock(name="viewer")
     conn = MagicMock()
     conn.url = "grpc://localhost:8815"
     # Default outcome: a connect that resolved to "not connected" (down). Tests
