@@ -1244,6 +1244,10 @@ class TensorBrowserWidget(QWidget):
         self._tree_widget.setContextMenuPolicy(Qt.CustomContextMenu)
         self._tree_widget.customContextMenuRequested.connect(self._show_context_menu)
         self._tree_widget.itemClicked.connect(self._on_tree_item_clicked)
+        # Every way of opening or closing a row (triangle, click, key, code)
+        # lands here, so the remembered state is what the user last left.
+        self._tree_widget.itemExpanded.connect(self._on_item_expanded)
+        self._tree_widget.itemCollapsed.connect(self._on_item_collapsed)
         self._tree_widget.itemDoubleClicked.connect(self._on_tree_item_double_clicked)
         self._tree_widget.setStyleSheet("QTreeWidget { min-height: 300px; }")
         layout.addWidget(self._tree_widget, stretch=1)
@@ -1860,6 +1864,13 @@ class TensorBrowserWidget(QWidget):
 
     def _build_and_display_tree(self, filtered_ids: Set[str] | None = None):
         """Build tree from sources and display in widget."""
+        # A rebuild of the same view (the watcher re-listing, a refresh) must
+        # not move it; a different view (a new search) starts at the selection.
+        view_key = self._filter_input.text().strip().lower()
+        keep_view = view_key == getattr(self, "_view_key", None)
+        self._view_key = view_key
+        scroll = self._tree_widget.verticalScrollBar()
+        scroll_pos = scroll.value()
         self._tree_widget.clear()
 
         if not self._sources:
@@ -1904,7 +1915,12 @@ class TensorBrowserWidget(QWidget):
         # Restore the highlighted item: the tree is cleared and rebuilt on every
         # filter/refresh, which drops Qt's current-item even though we still track
         # the logical selection (issue #191).
-        self._restore_selection()
+        self._restore_selection(scroll_to=not keep_view)
+        if keep_view:
+            # Layout is lazy; without it the scroll range is still empty and
+            # the value would clamp to the top.
+            self._tree_widget.doItemsLayout()
+            scroll.setValue(scroll_pos)
 
     def _add_tree_node(self, parent, node: _TreeNode):
         """Add a tree node to the widget."""
@@ -2056,6 +2072,14 @@ class TensorBrowserWidget(QWidget):
         self._remove_worker = None
         self._report_failure("Remove failed", msg)
 
+    def _on_item_expanded(self, item: QTreeWidgetItem):
+        if item.data(0, Qt.ItemDataRole.UserRole + 1) in ("folder", "source"):
+            self._expanded_folders.add(item.data(0, Qt.ItemDataRole.UserRole))
+
+    def _on_item_collapsed(self, item: QTreeWidgetItem):
+        if item.data(0, Qt.ItemDataRole.UserRole + 1) in ("folder", "source"):
+            self._expanded_folders.discard(item.data(0, Qt.ItemDataRole.UserRole))
+
     def _restore_expanded_state(self):
         """Restore expanded state for folders."""
 
@@ -2069,7 +2093,7 @@ class TensorBrowserWidget(QWidget):
         for i in range(self._tree_widget.topLevelItemCount()):
             restore_recursive(self._tree_widget.topLevelItem(i))
 
-    def _restore_selection(self):
+    def _restore_selection(self, scroll_to: bool = True):
         """Re-highlight the tracked source/tensor in a freshly rebuilt tree.
 
         Walk the new items, find the one matching ``_selected_source_id`` (and the
@@ -2110,7 +2134,8 @@ class TensorBrowserWidget(QWidget):
         target = target_tensor or target_source
         if target is not None:
             self._tree_widget.setCurrentItem(target)
-            self._tree_widget.scrollToItem(target)
+            if scroll_to:
+                self._tree_widget.scrollToItem(target)
 
     def _on_tree_item_clicked(self, item: QTreeWidgetItem, _column: int):
         """Handle tree item click."""
@@ -2120,13 +2145,7 @@ class TensorBrowserWidget(QWidget):
 
         if node_type == "folder":
             # Toggle expansion on click
-            item_id = item.data(0, Qt.ItemDataRole.UserRole)
-            expanded = not item.isExpanded()
-            item.setExpanded(expanded)
-            if expanded:
-                self._expanded_folders.add(item_id)
-            else:
-                self._expanded_folders.discard(item_id)
+            item.setExpanded(not item.isExpanded())
             self._metadata_pane.setVisible(False)
             return
 
@@ -2146,12 +2165,7 @@ class TensorBrowserWidget(QWidget):
 
             # Multi-tensor source: toggle its field list on click, like a folder
             if item.childCount() > 0:
-                expanded = not item.isExpanded()
-                item.setExpanded(expanded)
-                if expanded:
-                    self._expanded_folders.add(source_id)
-                else:
-                    self._expanded_folders.discard(source_id)
+                item.setExpanded(not item.isExpanded())
 
         self._update_metadata_display()
 
