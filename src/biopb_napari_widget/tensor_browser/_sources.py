@@ -25,7 +25,7 @@ SERVER_QUERY_THRESHOLD = 1000
 
 #: The watcher's poll interval backs off from the first to the second while
 #: the source count holds, and snaps back on a change.
-WATCH_MIN_INTERVAL_S = 2.0
+WATCH_MIN_INTERVAL_S = 30.0
 WATCH_MAX_INTERVAL_S = 60.0
 
 #: The columns ``_catalog`` decodes.

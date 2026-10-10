@@ -1244,6 +1244,10 @@ class TensorBrowserWidget(QWidget):
         self._tree_widget.setContextMenuPolicy(Qt.CustomContextMenu)
         self._tree_widget.customContextMenuRequested.connect(self._show_context_menu)
         self._tree_widget.itemClicked.connect(self._on_tree_item_clicked)
+        # Every way of opening or closing a row (triangle, click, key, code)
+        # lands here, so the remembered state is what the user last left.
+        self._tree_widget.itemExpanded.connect(self._on_item_expanded)
+        self._tree_widget.itemCollapsed.connect(self._on_item_collapsed)
         self._tree_widget.itemDoubleClicked.connect(self._on_tree_item_double_clicked)
         self._tree_widget.setStyleSheet("QTreeWidget { min-height: 300px; }")
         layout.addWidget(self._tree_widget, stretch=1)
@@ -1849,7 +1853,11 @@ class TensorBrowserWidget(QWidget):
         if not self._connected or self._connecting:
             return
         self._clear_error()
+        # The rebuild is not the user's doing, so it must not move their view.
+        scroll = self._tree_widget.verticalScrollBar()
+        pos = scroll.value()
         self._apply_filter()
+        scroll.setValue(pos)
 
     def closeEvent(self, event):
         """Stop the watcher; the list is this widget's alone."""
@@ -2056,6 +2064,14 @@ class TensorBrowserWidget(QWidget):
         self._remove_worker = None
         self._report_failure("Remove failed", msg)
 
+    def _on_item_expanded(self, item: QTreeWidgetItem):
+        if item.data(0, Qt.ItemDataRole.UserRole + 1) in ("folder", "source"):
+            self._expanded_folders.add(item.data(0, Qt.ItemDataRole.UserRole))
+
+    def _on_item_collapsed(self, item: QTreeWidgetItem):
+        if item.data(0, Qt.ItemDataRole.UserRole + 1) in ("folder", "source"):
+            self._expanded_folders.discard(item.data(0, Qt.ItemDataRole.UserRole))
+
     def _restore_expanded_state(self):
         """Restore expanded state for folders."""
 
@@ -2120,13 +2136,7 @@ class TensorBrowserWidget(QWidget):
 
         if node_type == "folder":
             # Toggle expansion on click
-            item_id = item.data(0, Qt.ItemDataRole.UserRole)
-            expanded = not item.isExpanded()
-            item.setExpanded(expanded)
-            if expanded:
-                self._expanded_folders.add(item_id)
-            else:
-                self._expanded_folders.discard(item_id)
+            item.setExpanded(not item.isExpanded())
             self._metadata_pane.setVisible(False)
             return
 
@@ -2146,12 +2156,7 @@ class TensorBrowserWidget(QWidget):
 
             # Multi-tensor source: toggle its field list on click, like a folder
             if item.childCount() > 0:
-                expanded = not item.isExpanded()
-                item.setExpanded(expanded)
-                if expanded:
-                    self._expanded_folders.add(source_id)
-                else:
-                    self._expanded_folders.discard(source_id)
+                item.setExpanded(not item.isExpanded())
 
         self._update_metadata_display()
 

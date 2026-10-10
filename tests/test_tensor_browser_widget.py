@@ -1721,3 +1721,85 @@ class TestRoiAnnotations:
         w._report_failure = MagicMock()
         w._on_rois_failed("annotations disabled")
         w._report_failure.assert_called_once()
+
+
+class TestExpandState:
+    """The tree is rebuilt by the watcher and refreshes; what the user opened
+    or closed must survive it, however they did it."""
+
+    def _populate(self, w):
+        global QtCore
+        from qtpy import QtCore
+
+        from biopb_napari_widget._catalog import CatalogSource, CatalogTensor
+        from biopb_napari_widget.tensor_browser._widget import (
+            TensorBrowserWidget,
+        )
+
+        w._list.sources = {
+            f"s{i}": CatalogSource(
+                source_id=f"s{i}",
+                source_url=f"/data/d{i % 3}/img_{i}.tif",
+                source_type="tiff",
+                tensors=(CatalogTensor(array_id=f"s{i}", shape=(8, 8), dtype="uint8"),),
+            )
+            for i in range(12)
+        }
+        w._build_and_display_tree = lambda **kw: (
+            TensorBrowserWidget._build_and_display_tree(w, **kw)
+        )
+        w._build_and_display_tree()
+
+    def _folders(self, w):
+        out = {}
+
+        def walk(item):
+            if item.data(0, QtCore.Qt.ItemDataRole.UserRole + 1) == "folder":
+                out[item.data(0, QtCore.Qt.ItemDataRole.UserRole)] = item
+            for i in range(item.childCount()):
+                walk(item.child(i))
+
+        for i in range(w._tree_widget.topLevelItemCount()):
+            walk(w._tree_widget.topLevelItem(i))
+        return out
+
+    def test_expanding_by_any_route_is_remembered_across_a_rebuild(self, widget):
+        w, _, _ = widget
+        self._populate(w)
+        folders = self._folders(w)
+        target = next(
+            k for k, it in folders.items() if it.childCount() and not it.isExpanded()
+        )
+        folders[target].setExpanded(True)  # as the triangle does: no click event
+        w._build_and_display_tree()
+        assert self._folders(w)[target].isExpanded()
+        self._folders(w)[target].setExpanded(False)
+        w._build_and_display_tree()
+        assert not self._folders(w)[target].isExpanded()
+
+    def test_watcher_rebuild_keeps_the_scroll_position(self, widget):
+        w, _, _ = widget
+        self._populate(w)
+        w._conn.client = MagicMock()  # connected
+        w._connecting = False
+        bar = w._tree_widget.verticalScrollBar()
+        w._tree_widget.setStyleSheet("")  # drop the 300px min-height
+        w._tree_widget.setFixedHeight(60)
+        w._tree_widget.expandAll()
+        w.show()
+        w._tree_widget.doItemsLayout()
+        bar.setValue(bar.maximum())
+        pos = bar.value()
+        assert pos > 0
+        w._on_sources_changed(w._list.sources)
+        assert bar.value() == pos
+
+
+def test_watcher_polls_every_half_minute_at_least():
+    from biopb_napari_widget.tensor_browser._sources import (
+        WATCH_MAX_INTERVAL_S,
+        WATCH_MIN_INTERVAL_S,
+    )
+
+    assert WATCH_MIN_INTERVAL_S >= 30
+    assert WATCH_MAX_INTERVAL_S >= WATCH_MIN_INTERVAL_S
