@@ -563,6 +563,39 @@ class TestSourcesChangedGuard:
         w._apply_filter.assert_not_called()
 
 
+class TestRowShape:
+    @pytest.mark.parametrize(
+        "shape,expect",
+        [
+            ([1, 1, 5, 512, 512], "5×512×512"),
+            ([1, 3, 512, 512], "3×512×512"),
+            ([512, 512], "512×512"),
+            ([5, 1, 512], "5×1×512"),  # only *leading* singletons go
+            ([1, 1, 1], "1"),
+        ],
+    )
+    def test_leading_singletons_are_squeezed(self, shape, expect):
+        from biopb_napari_widget.tensor_browser._widget import _row_shape
+
+        assert _row_shape(shape) == expect
+
+    def test_row_keeps_the_shape_as_a_suffix_not_in_its_text(self, widget):
+        from biopb_napari_widget.tensor_browser._widget import _SUFFIX_ROLE, _TreeNode
+
+        w, _, _ = widget
+        src = _source("a", tensors=["a"])
+        w._add_tree_node(
+            w._tree_widget,
+            _TreeNode(
+                node_id="a", name="a.zarr", node_type="source", depth=0, source=src
+            ),
+        )
+        item = w._tree_widget.topLevelItem(0)
+        assert item.text(0) == "a.zarr"
+        assert item.data(0, _SUFFIX_ROLE) == "8×8"
+        assert "[" not in item.toolTip(0)
+
+
 class TestCloudGlyph:
     """A `needs_recall` source row carries a cloud glyph; every source row has
     the same icon slot so the names stay aligned."""
@@ -724,7 +757,7 @@ class TestHidesEmptySources:
             widget,
             [self._src("empty", tensors=[]), self._src("full", tensors=["full"])],
         )
-        assert names == ["full.zarr  [8×8]"]
+        assert names == ["full.zarr"]
 
     def test_an_unresolved_source_still_gets_its_row(self, widget):
         # Its empty tensor list means "unknown", not "nothing" -- it still

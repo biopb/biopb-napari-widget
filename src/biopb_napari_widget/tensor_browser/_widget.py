@@ -18,7 +18,7 @@ from urllib.parse import urlparse
 
 from biopb.tensor import Connection, ResolveCancelled
 from qtpy.QtCore import QSize, Qt, QThread, QTimer, Signal
-from qtpy.QtGui import QColor, QFont, QIcon, QPainter, QPixmap
+from qtpy.QtGui import QColor, QFont, QFontMetrics, QIcon, QPainter, QPalette, QPixmap
 from qtpy.QtWidgets import (
     QApplication,
     QDialog,
@@ -31,6 +31,9 @@ from qtpy.QtWidgets import (
     QProgressDialog,
     QPushButton,
     QSizePolicy,
+    QStyle,
+    QStyledItemDelegate,
+    QStyleOptionViewItem,
     QTextEdit,
     QTreeWidget,
     QTreeWidgetItem,
@@ -149,6 +152,83 @@ _GLYPH_W, _GLYPH_H = 26, 16
 def _format_shape(shape: List[int]) -> str:
     """Format shape as compact string."""
     return "×".join(str(s) for s in shape)
+
+
+def _row_shape(shape: List[int]) -> str:
+    """Shape for a tree row: leading singleton axes squeezed out (a (1, 1, Z, Y,
+    X) source reads Z×Y×X); an all-singleton shape keeps its last axis."""
+    dims = list(shape)
+    while len(dims) > 1 and dims[0] == 1:
+        dims.pop(0)
+    return _format_shape(dims)
+
+
+#: Item data role holding a row's suffix (shape / tensor count), which
+#: ``_SuffixDelegate`` draws small and grey after the name.
+_SUFFIX_ROLE = Qt.ItemDataRole.UserRole + 3
+
+
+class _SuffixDelegate(QStyledItemDelegate):
+    """Draws a row's name as usual and its suffix after it, smaller and grey.
+
+    The name elides first, so the suffix stays readable on a narrow panel.
+    """
+
+    _GAP = 8
+
+    def paint(self, painter, option, index):
+        suffix = index.data(_SUFFIX_ROLE)
+        if not suffix:
+            super().paint(painter, option, index)
+            return
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        name = opt.text
+        opt.text = ""
+        style = opt.widget.style() if opt.widget else QApplication.style()
+        style.drawControl(
+            QStyle.ControlElement.CE_ItemViewItem, opt, painter, opt.widget
+        )
+        rect = style.subElementRect(
+            QStyle.SubElement.SE_ItemViewItemText, opt, opt.widget
+        )
+
+        small = QFont(opt.font)
+        if small.pointSizeF() > 0:
+            small.setPointSizeF(small.pointSizeF() * 0.85)
+        else:
+            small.setPixelSize(max(1, round(small.pixelSize() * 0.85)))
+        suffix_w = QFontMetrics(small).horizontalAdvance(suffix)
+        name_w = max(rect.width() - suffix_w - self._GAP, rect.width() // 2)
+        elided = QFontMetrics(opt.font).elidedText(
+            name, Qt.TextElideMode.ElideRight, name_w
+        )
+
+        selected = bool(opt.state & QStyle.StateFlag.State_Selected)
+        group = QPalette.ColorGroup.Active
+        fg = opt.palette.color(
+            group,
+            QPalette.ColorRole.HighlightedText if selected else QPalette.ColorRole.Text,
+        )
+        grey = QColor(fg)
+        grey.setAlphaF(0.6)
+
+        painter.save()
+        painter.setFont(opt.font)
+        painter.setPen(fg)
+        painter.drawText(
+            rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, elided
+        )
+        x = rect.left() + QFontMetrics(opt.font).horizontalAdvance(elided) + self._GAP
+        if x + suffix_w <= rect.right() + 1:
+            painter.setFont(small)
+            painter.setPen(grey)
+            painter.drawText(
+                rect.adjusted(x - rect.left(), 0, 0, 0),
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                suffix,
+            )
+        painter.restore()
 
 
 def _tensor_short_name(array_id: str) -> str:
@@ -1047,6 +1127,9 @@ class TensorBrowserWidget(QWidget):
         self._tree_widget.setExpandsOnDoubleClick(False)
         self._tree_widget.setIndentation(12)
         self._tree_widget.setIconSize(QSize(_GLYPH_W, _GLYPH_H))
+        self._tree_widget.setItemDelegateForColumn(
+            0, _SuffixDelegate(self._tree_widget)
+        )
         # Column 0 stretches to the viewport and row text elides (ElideRight is
         # the QTreeView default), so a horizontal scrollbar is never needed. Pin
         # it off: left ScrollBarAsNeeded, its show/hide toggles as the widest
@@ -1764,20 +1847,21 @@ class TensorBrowserWidget(QWidget):
             # Label sets ride under their image rather than counting as
             # tensors of the source; see _group_tensors.
             groups = _group_tensors(src.tensors)
-            display_name = node.name
+            suffix = ""
             if len(groups) == 1:
-                # Show shape badge for single tensor
-                shape_str = _format_shape(groups[0].image.shape)
-                display_name = f"{node.name}  [{shape_str}]"
+                # Shape for a single tensor
+                suffix = _row_shape(groups[0].image.shape)
             elif len(groups) > 1:
-                # Show tensor count
-                display_name = f"{node.name}  [{len(groups)} tensors]"
+                suffix = f"{len(groups)} tensors"
+            if suffix:
+                display_name = f"{node.name}  {suffix}"
             else:
                 display_name = f"{node.name}{_unresolved_badge(src)}"
 
             # No residency indicator: drawing one cost a live stat walk per
             # source on every browse (biopb/biopb#1048).
-            item.setText(0, display_name)
+            item.setText(0, node.name if suffix else display_name)
+            item.setData(0, _SUFFIX_ROLE, suffix)
             # The horizontal scrollbar is pinned off (biopb/biopb#367), so the
             # full label -- which elides when it outgrows the panel -- is only
             # readable on hover.
@@ -1810,16 +1894,16 @@ class TensorBrowserWidget(QWidget):
         row.setData(0, Qt.ItemDataRole.UserRole, tensor.array_id)
         row.setData(0, Qt.ItemDataRole.UserRole + 1, "tensor")
         row.setData(0, Qt.ItemDataRole.UserRole + 2, src.source_id)
-        shape_str = _format_shape(tensor.shape)
+        row.setData(0, _SUFFIX_ROLE, _row_shape(tensor.shape))
         if is_label:
             address = split_label_array_id(tensor.array_id)
             # The set's own name, not the last path segment: a native pyramid
             # level would otherwise be what the row reads.
             name = address.name if address else _tensor_short_name(tensor.array_id)
-            text = f"{_LABEL_GLYPH} {name}  [{shape_str}]"
+            text = f"{_LABEL_GLYPH} {name}"
             row.setToolTip(0, f"Label set “{name}” — adds as a Labels layer")
         else:
-            text = f"{_tensor_short_name(tensor.array_id)}  [{shape_str}]"
+            text = _tensor_short_name(tensor.array_id)
         row.setText(0, text)
         return row
 
