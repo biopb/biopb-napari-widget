@@ -41,6 +41,8 @@ def _result(added=(), already=(), refreshed=(), removed=(), failed=()):
     r.refreshed = list(refreshed)
     r.removed = list(removed)
     r.failed = [MagicMock(path=p, reason=why) for p, why in failed]
+    r.skipped_offline = 0
+    r.skipped_cloud_dirs = 0
     return r
 
 
@@ -254,7 +256,7 @@ def test_confirm_cloud_drop_prompts_only_under_cloud(monkeypatch):
 def _run_worker(sources, cloud=False):
     worker = _AddSourceWorker(sources, "/A", cloud)
     skipped = []
-    worker.skipped_offline.connect(skipped.append)
+    worker.skipped.connect(lambda files, dirs: skipped.append((files, dirs)))
     worker.run()
     return skipped
 
@@ -269,16 +271,23 @@ def test_worker_sends_cloud_only_when_asked(_qapp):
 
 
 @pytest.mark.parametrize(
-    "skipped,expect",
-    [(3, [3]), (0, []), (None, [])],  # None: an older result
+    "files,dirs,expect",
+    [
+        (3, 0, [(3, 0)]),
+        (0, 2, [(0, 2)]),  # a skipped OneDrive dir alone is enough
+        (3, 2, [(3, 2)]),
+        (0, 0, []),
+        (None, None, []),  # an older result
+    ],
 )
-def test_worker_reports_skipped_offline(_qapp, skipped, expect):
+def test_worker_reports_skipped(_qapp, files, dirs, expect):
     sources = MagicMock()
     result = _result()
-    if skipped is None:
-        del result.skipped_offline
-    else:
-        result.skipped_offline = skipped
+    for field, value in (("skipped_offline", files), ("skipped_cloud_dirs", dirs)):
+        if value is None:
+            delattr(result, field)
+        else:
+            setattr(result, field, value)
     sources.add.return_value = result
     assert _run_worker(sources) == expect
 
@@ -287,6 +296,7 @@ def test_worker_does_not_ask_again_after_a_cloud_drop(_qapp):
     sources = MagicMock()
     result = _result()
     result.skipped_offline = 2
+    result.skipped_cloud_dirs = 1
     sources.add.return_value = result
     assert _run_worker(sources, cloud=True) == []
 
@@ -335,14 +345,15 @@ def test_skipped_offline_is_reported_not_offered(monkeypatch):
         lambda *a, **k: pytest.fail("must not prompt"),
     )
     widget = MagicMock()
-    TensorBrowserWidget._on_add_skipped_offline(widget, "/dbx/data", 4)
+    TensorBrowserWidget._on_add_skipped(widget, "/dbx/data", 4, 0)
     assert "4 offline files" in shown[0]
+    assert "OneDrive" not in shown[0]
     widget._start_add.assert_not_called()
 
 
 class _RedropStub:
     def __init__(self, remembered=()):
-        self._skipped_offline_paths = set(remembered)
+        self._skipped_cloud_paths = set(remembered)
 
 
 @pytest.mark.parametrize("answer,expect", [("Yes", True), ("No", False)])
@@ -373,6 +384,25 @@ def test_redrop_of_another_path_does_not_ask(monkeypatch):
 def test_skipped_offline_notice_remembers_the_path(monkeypatch):
     monkeypatch.setattr(_widget.QMessageBox, "information", lambda *a, **k: None)
     widget = MagicMock()
-    widget._skipped_offline_paths = set()
-    TensorBrowserWidget._on_add_skipped_offline(widget, "/dbx/data", 2)
-    assert widget._skipped_offline_paths == {"/dbx/data"}
+    widget._skipped_cloud_paths = set()
+    TensorBrowserWidget._on_add_skipped(widget, "/dbx/data", 2, 0)
+    assert widget._skipped_cloud_paths == {"/dbx/data"}
+
+
+def test_skipped_onedrive_dirs_alone_make_a_potential_cloud_root(monkeypatch):
+    shown = []
+    monkeypatch.setattr(
+        _widget.QMessageBox, "information", lambda *a, **k: shown.append(a[2])
+    )
+    widget = MagicMock()
+    widget._skipped_cloud_paths = set()
+    TensorBrowserWidget._on_add_skipped(widget, "/data/parent", 0, 2)
+    assert widget._skipped_cloud_paths == {"/data/parent"}
+    assert "2 OneDrive folders" in shown[0]
+    assert "offline" not in shown[0]
+    # A re-drop after removal then asks about cloud mode.
+    stub = _RedropStub(widget._skipped_cloud_paths)
+    monkeypatch.setattr(
+        _widget.QMessageBox, "question", lambda *a, **k: _widget.QMessageBox.Yes
+    )
+    assert TensorBrowserWidget._confirm_cloud_redrop(stub, "/data/parent") is True
