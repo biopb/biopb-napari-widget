@@ -41,12 +41,12 @@ from qtpy.QtWidgets import (
     QWidget,
 )
 
-from .._catalog import CatalogSource
+from .._catalog import CatalogSource, sources_from_rows
 from .._labels import split_label_array_id
 from .._rois import add_roi_layers, image_scale, roi_layer_specs
 from .._tensor_utils import add_tensor_layer
 from .._urls import is_local_url
-from ._sources import SourceList
+from ._sources import SourceList, source_columns
 
 if TYPE_CHECKING:
     import napari
@@ -498,13 +498,14 @@ SERVER_QUERY_LIMIT = 2000
 AUTO_EXPAND_DEPTH = 1
 
 
-def _search_sql(query: str) -> str:
-    """The catalog query for a (lowercased, trimmed) search *query*: ids of the
-    sources whose id, url or type contain it, in url order, one past the limit."""
+def _search_sql(query: str, columns: str = "source_id") -> str:
+    """The catalog query for a (lowercased, trimmed) search *query*: the
+    *columns* (the ids by default) of the sources whose id, url or type contain
+    it, in url order, one past the limit."""
     escaped = query.replace("\\", "\\\\").replace("'", "''")
     escaped = escaped.replace("%", "\\%").replace("_", "\\_")
     return (
-        "SELECT source_id FROM sources WHERE "
+        f"SELECT {columns} FROM sources WHERE "
         f"LOWER(source_id) LIKE '%{escaped}%' ESCAPE '\\' OR "
         f"LOWER(source_url) LIKE '%{escaped}%' ESCAPE '\\' OR "
         f"LOWER(source_type) LIKE '%{escaped}%' ESCAPE '\\' "
@@ -524,15 +525,24 @@ class _SearchWorker(QThread):
     done = Signal(int, object, bool)  # generation, source ids, more matched
     failed = Signal(int)
 
-    def __init__(self, client, query: str, generation: int):
+    def __init__(self, client, query: str, generation: int, columns=None, keep=None):
         super().__init__()
         self._client = client
         self._query = query
         self._generation = generation
+        # When the listing does not hold the catalog (it is read a folder at a
+        # time), the matches come back whole and are handed to *keep*.
+        self._columns = columns
+        self._keep = keep
 
     def run(self):
         try:
-            rows = self._client.query(_search_sql(self._query), format="records")
+            rows = self._client.query(
+                _search_sql(self._query, self._columns or "source_id"),
+                format="records",
+            )
+            if self._keep is not None:
+                self._keep({s.source_id: s for s in sources_from_rows(rows)})
         except Exception:
             logger.exception("Server search failed")
             self.failed.emit(self._generation)
@@ -543,6 +553,27 @@ class _SearchWorker(QThread):
             set(ids[:SERVER_QUERY_LIMIT]),
             len(ids) > SERVER_QUERY_LIMIT,
         )
+
+
+class _LevelWorker(QThread):
+    """Reads one folder of the catalog off the GUI thread."""
+
+    done = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self, sources: SourceList, key: str):
+        super().__init__()
+        self._sources = sources
+        self._key = key
+
+    def run(self):
+        try:
+            self._sources.load_level(self._key)
+        except Exception:
+            logger.exception("Reading folder %r failed", self._key)
+            self.failed.emit(self._key)
+            return
+        self.done.emit(self._key)
 
 
 class _RoiWorker(QThread):
@@ -679,6 +710,15 @@ def _human_bytes(n: int) -> str:
             return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
         size /= 1024
     return f"{size:.1f} TB"
+
+
+#: Under a folder the server holds more of than it sent.
+_FOLDER_CUT_NOTE = "Only part of this folder is shown - search to find the rest"
+
+
+def _note(text: str, depth: int) -> _TreeNode:
+    """A line in the tree that is not an item: loading, failed, or cut short."""
+    return _TreeNode(node_id="", name=text, node_type="note", depth=depth)
 
 
 def _build_tree(sources: Dict[str, CatalogSource]) -> _TreeNode:
@@ -1039,6 +1079,8 @@ class TensorBrowserWidget(QWidget):
         # is the agent's next ``client`` too. Standalone, the widget owns it.
         self._conn = connection or Connection()
         self._list = SourceList(self._conn)
+        # The watcher re-reads the folders the user has open.
+        self._list.open_keys = lambda: set(self._expanded_folders)
         # Set once a connect finds no control: the URL and token fields are
         # then how a plane is named, until the control answers again.
         self._manual = False
@@ -1092,6 +1134,16 @@ class TensorBrowserWidget(QWidget):
         self._search_worker: _SearchWorker | None = None
         self._search_retain: set = set()
         self._search_more = False
+        # Folders read on demand (see SourceList.lazy): those being read, those
+        # that failed, and the workers, held until they finish. Whether the tree
+        # on screen is the folder view (a search shows another).
+        self._level_loading: Set[str] = set()
+        self._level_failed: Set[str] = set()
+        self._level_retain: set = set()
+        self._lazy_view = False
+        # The folder items on screen by key, so a folder that lands is grafted
+        # in place instead of the whole tree being rebuilt.
+        self._folder_items: Dict[str, QTreeWidgetItem] = {}
         # In-flight ROI fetches, kept alive until they finish.
         self._roi_retain: set = set()
         self._setup_ui()
@@ -1338,6 +1390,8 @@ class TensorBrowserWidget(QWidget):
         self._metadata_pane.setVisible(False)
         self._selected_source_id = None
         self._selected_tensor_id = None
+        self._level_loading.clear()
+        self._level_failed.clear()
 
         self._connect_gen += 1
         gen = self._connect_gen
@@ -1399,8 +1453,7 @@ class TensorBrowserWidget(QWidget):
             self._refresh_button.setEnabled(False)
             return
 
-        sources = self._list.sources
-        if not sources:
+        if self._catalog_empty():
             # While the server is still indexing, keep Refresh enabled (more
             # sources are coming, and the watcher re-lists as they appear); a
             # genuinely empty server leaves it disabled, as before.
@@ -1411,12 +1464,25 @@ class TensorBrowserWidget(QWidget):
         if self._use_server_query:
             logger.info(
                 "Large catalog (%d sources), server-side SQL filter enabled",
-                len(sources),
+                self._catalog_size(),
             )
         self._update_search_chrome()
 
         self._build_and_display_tree()
         self._refresh_button.setEnabled(True)
+
+    def _catalog_empty(self) -> bool:
+        """Nothing to show: no sources, or (read by folder) an empty top."""
+        if self._list.lazy:
+            top = self._list.levels.get("") or {}
+            return not (top.get("folders") or top.get("sources"))
+        return not self._list.sources
+
+    def _catalog_size(self) -> int:
+        """Sources in the catalog: the server's count when only some are held."""
+        if self._list.lazy:
+            return self._list.scan_source_count()
+        return len(self._sources)
 
     def _toggle_advanced(self):
         """Show/hide the full connection controls behind the summary line."""
@@ -1811,7 +1877,7 @@ class TensorBrowserWidget(QWidget):
             return
 
         try:
-            sources = self._list.refresh()
+            self._list.refresh()
         except Exception:
             # A failed re-list almost always means the server is gone. Drop the
             # shared client so the indicator, and the agent's next job, say so;
@@ -1827,7 +1893,7 @@ class TensorBrowserWidget(QWidget):
             return
 
         try:
-            if not sources:
+            if self._catalog_empty():
                 self._show_empty_state()
                 self._tree_widget.clear()
                 return
@@ -1872,6 +1938,13 @@ class TensorBrowserWidget(QWidget):
         scroll = self._tree_widget.verticalScrollBar()
         scroll_pos = scroll.value()
         self._tree_widget.clear()
+        self._folder_items = {}
+
+        self._lazy_view = bool(self._list.lazy) and filtered_ids is None
+        if self._lazy_view:
+            self._display_levels()
+            self._finish_display(keep_view, scroll, scroll_pos)
+            return
 
         if not self._sources:
             return
@@ -1910,7 +1983,10 @@ class TensorBrowserWidget(QWidget):
                 self._expanded_folders.add(child.node_id)
             self._initial_expand_done = True
 
-        # Restore expanded state
+        self._finish_display(keep_view, scroll, scroll_pos)
+
+    def _finish_display(self, keep_view: bool, scroll, scroll_pos: int):
+        """What follows filling the tree: its expansion, selection and scroll."""
         self._restore_expanded_state()
         # Restore the highlighted item: the tree is cleared and rebuilt on every
         # filter/refresh, which drops Qt's current-item even though we still track
@@ -1922,9 +1998,70 @@ class TensorBrowserWidget(QWidget):
             self._tree_widget.doItemsLayout()
             scroll.setValue(scroll_pos)
 
+    def _display_levels(self):
+        """Fill the tree from the folders read so far.
+
+        Only an open folder with a read level has children, so the work follows
+        what is on screen. A closed folder holds a placeholder, so it can be
+        opened; opening reads it (:meth:`_on_item_expanded`).
+        """
+        top = self._list.levels.get("")
+        if top is None:
+            return
+        if not self._initial_expand_done:
+            # A lone top folder is the way in; open it rather than show one row.
+            if len(top["folders"]) == 1 and not top["sources"]:
+                self._expanded_folders.add(top["folders"][0]["key"])
+            self._initial_expand_done = True
+        for node in self._level_nodes("", 1):
+            self._add_tree_node(self._tree_widget, node)
+
+    def _level_nodes(self, key: str, depth: int) -> List[_TreeNode]:
+        levels, sources = self._list.levels, self._list.sources
+        dropped = self._list.dropped_roots
+        level = levels[key]
+        nodes: List[_TreeNode] = []
+        for folder in level["folders"]:
+            fkey = folder["key"]
+            node = _TreeNode(fkey, folder["name"], "folder", depth)
+            if depth == 1:
+                # Tagged by name: a plain folder of the same name would show the
+                # [x] too, and removing it would find no such drop.
+                root = _DND_URL_PREFIX + fkey.split("/")[0]
+                if root in dropped:
+                    node.dropped, node.remove_root = True, root
+            if fkey in self._expanded_folders and fkey in levels:
+                node.children = self._level_nodes(fkey, depth + 1)
+            elif fkey in self._level_failed:
+                node.children = [_note("Could not load this folder", depth + 1)]
+            else:
+                node.children = [_note("Loading…", depth + 1)]
+            nodes.append(node)
+        for entry in level["sources"]:
+            src = sources.get(entry["source_id"])
+            if src is None or _is_empty_source(src):
+                continue
+            node = _TreeNode(src.source_id, entry["name"], "source", depth, src)
+            root = _DND_URL_PREFIX + entry["name"]
+            if depth == 1 and src.source_url == root:
+                node.dropped, node.remove_root = True, root
+            nodes.append(node)
+        if level.get("truncated"):
+            nodes.append(_note(_FOLDER_CUT_NOTE, depth))
+        return nodes
+
     def _add_tree_node(self, parent, node: _TreeNode):
         """Add a tree node to the widget."""
         item = QTreeWidgetItem(parent)
+        if node.node_type == "note":
+            item.setText(0, node.name)
+            item.setData(0, Qt.ItemDataRole.UserRole + 1, "note")
+            item.setFlags(Qt.ItemFlag.ItemIsEnabled)  # shown, not selectable
+            font = item.font(0)
+            font.setItalic(True)
+            item.setFont(0, font)
+            item.setForeground(0, QColor("#888"))
+            return
         item.setData(0, Qt.ItemDataRole.UserRole, node.node_id)
         item.setData(0, Qt.ItemDataRole.UserRole + 1, node.node_type)
 
@@ -1940,6 +2077,8 @@ class TensorBrowserWidget(QWidget):
             # The horizontal scrollbar is pinned off (biopb/biopb#367), so a long
             # or deeply-indented label that elides is only readable on hover.
             item.setToolTip(0, node.name)
+            if self._lazy_view:
+                self._folder_items[node.node_id] = item
             for child in node.children:
                 self._add_tree_node(item, child)
         else:
@@ -2073,15 +2212,73 @@ class TensorBrowserWidget(QWidget):
         self._report_failure("Remove failed", msg)
 
     def _on_item_expanded(self, item: QTreeWidgetItem):
-        if item.data(0, Qt.ItemDataRole.UserRole + 1) in ("folder", "source"):
-            self._expanded_folders.add(item.data(0, Qt.ItemDataRole.UserRole))
+        kind = item.data(0, Qt.ItemDataRole.UserRole + 1)
+        if kind in ("folder", "source"):
+            key = item.data(0, Qt.ItemDataRole.UserRole)
+            self._expanded_folders.add(key)
+            # A folder that failed is tried again when it is opened again, not
+            # by the rebuild that shows the failure.
+            if (
+                kind == "folder"
+                and self._lazy_view
+                and key not in self._list.levels
+                and key not in self._level_failed
+            ):
+                self._load_level(key)
+
+    def _load_level(self, key: str):
+        """Read a folder off the GUI thread; the tree fills when it lands."""
+        if key in self._level_loading or not self._connected:
+            return
+        self._level_loading.add(key)
+        self._level_failed.discard(key)
+        worker = _LevelWorker(self._list, key)
+        self._level_retain.add(worker)
+        worker.done.connect(self._on_level_done)
+        worker.failed.connect(self._on_level_failed)
+        worker.finished.connect(lambda w=worker: self._level_retain.discard(w))
+        worker.start()
+
+    def _on_level_done(self, key: str):
+        self._level_loading.discard(key)
+        self._graft_level(key)
+
+    def _on_level_failed(self, key: str):
+        self._level_loading.discard(key)
+        self._level_failed.add(key)
+        self._graft_level(key)
+
+    def _graft_level(self, key: str):
+        """Fill one folder's item from its level (or its failure), leaving the
+        rest of the tree as it is: what a folder costs is its own rows, not
+        those of every folder already open."""
+        item = self._folder_items.get(key) if self._lazy_view else None
+        if item is None:
+            return  # not on screen; the next full build shows it
+        tree = self._tree_widget
+        tree.setUpdatesEnabled(False)
+        try:
+            item.takeChildren()
+            if key in self._list.levels:
+                nodes = self._level_nodes(key, 2)
+            else:
+                nodes = [_note("Could not load this folder", 2)]
+            for node in nodes:
+                self._add_tree_node(item, node)
+            for i in range(item.childCount()):
+                self._restore_expanded_state(item.child(i))
+            self._restore_selection(scroll_to=False)
+        finally:
+            tree.setUpdatesEnabled(True)
 
     def _on_item_collapsed(self, item: QTreeWidgetItem):
         if item.data(0, Qt.ItemDataRole.UserRole + 1) in ("folder", "source"):
-            self._expanded_folders.discard(item.data(0, Qt.ItemDataRole.UserRole))
+            key = item.data(0, Qt.ItemDataRole.UserRole)
+            self._level_failed.discard(key)
+            self._expanded_folders.discard(key)
 
-    def _restore_expanded_state(self):
-        """Restore expanded state for folders."""
+    def _restore_expanded_state(self, under: QTreeWidgetItem | None = None):
+        """Restore expanded state for folders (below *under*, else everywhere)."""
 
         def restore_recursive(item: QTreeWidgetItem):
             item_id = item.data(0, Qt.ItemDataRole.UserRole)
@@ -2090,6 +2287,9 @@ class TensorBrowserWidget(QWidget):
             for i in range(item.childCount()):
                 restore_recursive(item.child(i))
 
+        if under is not None:
+            restore_recursive(under)
+            return
         for i in range(self._tree_widget.topLevelItemCount()):
             restore_recursive(self._tree_widget.topLevelItem(i))
 
@@ -2143,6 +2343,8 @@ class TensorBrowserWidget(QWidget):
 
         node_type = item.data(0, Qt.ItemDataRole.UserRole + 1)
 
+        if node_type == "note":
+            return
         if node_type == "folder":
             # Toggle expansion on click
             item.setExpanded(not item.isExpanded())
@@ -2174,7 +2376,7 @@ class TensorBrowserWidget(QWidget):
         node_type = item.data(0, Qt.ItemDataRole.UserRole + 1)
 
         # Skip folders
-        if node_type == "folder":
+        if node_type in ("folder", "note"):
             return
 
         # Determine selection and add to viewer
@@ -2210,7 +2412,7 @@ class TensorBrowserWidget(QWidget):
         node_type = item.data(0, Qt.ItemDataRole.UserRole + 1)
 
         # Skip folders
-        if node_type == "folder":
+        if node_type in ("folder", "note"):
             return
 
         # Determine selection for menu actions
@@ -2584,7 +2786,14 @@ class TensorBrowserWidget(QWidget):
         """Ask the server for the matches, off the GUI thread. The tree stays as
         it is until the answer lands."""
         self._search_generation += 1
-        worker = _SearchWorker(self._client, query, self._search_generation)
+        lazy = self._list.lazy
+        worker = _SearchWorker(
+            self._client,
+            query,
+            self._search_generation,
+            columns=source_columns(self._client) if lazy else None,
+            keep=self._list.add_sources if lazy else None,
+        )
         self._search_worker = worker
         self._search_retain.add(worker)
         worker.done.connect(self._on_search_done)
@@ -2603,9 +2812,14 @@ class TensorBrowserWidget(QWidget):
     def _on_search_failed(self, generation: int):
         if generation != self._search_generation:
             return
-        # Fall back to filtering the listing we already hold.
         self._search_more = False
         self._update_search_chrome()
+        if self._list.lazy:
+            # The listing holds a few folders, not the catalog: filtering it
+            # would pass for the answer.
+            self._show_error("Search failed — the server did not answer")
+            return
+        # Fall back to filtering the listing we already hold.
         self._apply_client_filter(self._filter_input.text().strip().lower())
 
     def _update_search_chrome(self, searching: bool = False):
@@ -2615,7 +2829,7 @@ class TensorBrowserWidget(QWidget):
             self._search_status.setVisible(False)
             return
         self._filter_input.setPlaceholderText("Search (SQL filter)")
-        text = f"{len(self._sources):,} sources • Server-side filter"
+        text = f"{self._catalog_size():,} sources • Server-side filter"
         if searching:
             text += " • Searching…"
         elif self._search_more:

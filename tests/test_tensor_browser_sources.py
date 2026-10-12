@@ -3,6 +3,7 @@
 Qt-free: a fake connection whose client serves a catalog and a health sequence.
 """
 
+import re
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -270,3 +271,171 @@ class TestRoiSets:
         sl.clear()
         sl.refresh()
         assert sl.roi_sets == {}
+
+
+def _level(folders=(), sources=(), truncated=False):
+    return {
+        "key": "",
+        "folders": [{"name": f, "key": f} for f in folders],
+        "sources": [{"name": f"{s}.zarr", "source_id": s} for s in sources],
+        "truncated": truncated,
+    }
+
+
+def _lazy_listing(levels, catalog=None):
+    """A SourceList on a server that serves *levels* ({key: level}) a folder at
+    a time, with descriptors for every source id in the catalog."""
+    client = MagicMock()
+    client.catalog_children.side_effect = lambda key, limit: levels[key]
+
+    def query(sql, **_kw):
+        if "FROM rois" in sql or "dnd://" in sql:
+            return []
+        wanted = re.findall(r"'((?:[^']|'')*)'", sql.split(" IN ", 1)[-1])
+        return _rows([w.replace("''", "'") for w in wanted])
+
+    client.query.side_effect = query
+    client.source_row_columns.side_effect = AttributeError
+    return SourceList(SimpleNamespace(client=client)), client
+
+
+class TestLazyListing:
+    """A server with ``catalog_children`` is read a folder at a time."""
+
+    def test_reads_the_top_and_only_the_open_folders(self):
+        levels = {
+            "": _level(folders=["a", "b"], sources=["t"]),
+            "a": _level(sources=["x", "y"]),
+            "b": _level(sources=["z"]),
+        }
+        listing, client = _lazy_listing(levels)
+        listing.refresh()
+        assert listing.lazy and set(listing.levels) == {""}
+        assert set(listing.sources) == {"t"}  # descriptors of what is shown only
+
+        listing.load_level("a")
+        assert set(listing.levels) == {"", "a"}
+        assert set(listing.sources) == {"t", "x", "y"}
+
+        # A re-list reads the top and the open folder, and not "b".
+        listing.open_keys = lambda: {"a", "b"}
+        client.catalog_children.reset_mock()
+        listing.refresh()
+        assert [c[0][0] for c in client.catalog_children.call_args_list] == ["", "a"]
+
+    def test_descriptors_are_asked_for_by_id_in_bounded_statements(self):
+        ids = [f"s{i}" for i in range(1200)] + ["it's"]
+        listing, client = _lazy_listing({"": _level(sources=ids)})
+        listing.refresh()
+        sqls = [
+            c[0][0] for c in client.query.call_args_list if "source_id IN" in c[0][0]
+        ]
+        assert len(sqls) == 3  # 500 + 500 + 201
+        assert "'it''s'" in sqls[-1]
+
+    def test_a_server_without_the_action_is_listed_whole(self):
+        listing, client = _listing(["a", "b"])
+        client.catalog_children.side_effect = RuntimeError(
+            "Browsing the catalog tree is unavailable: the tensor server is too "
+            "old to support the 'catalog_children' action."
+        )
+        listing.refresh()
+        assert not listing.lazy and set(listing.sources) == {"a", "b"}
+        client.catalog_children.reset_mock()
+        listing.refresh()  # not asked again
+        client.catalog_children.assert_not_called()
+
+    def test_an_unrelated_failure_is_not_taken_for_an_old_server(self):
+        client = MagicMock()
+        client.catalog_children.side_effect = RuntimeError("Not connected")
+        listing = SourceList(SimpleNamespace(client=client))
+        try:
+            listing.refresh()
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("should have raised")
+
+    def test_a_folder_that_fails_to_re_read_keeps_its_last_level(self):
+        levels = {"": _level(folders=["a"]), "a": _level(sources=["x"])}
+        listing, client = _lazy_listing(levels)
+        listing.refresh()
+        listing.load_level("a")
+        before = listing.levels["a"]
+
+        def children(key, limit):
+            if key == "a":
+                raise ConnectionError("blip")
+            return levels[key]
+
+        client.catalog_children.side_effect = children
+        listing.open_keys = lambda: {"a"}
+        listing.refresh()
+        assert listing.levels["a"] is before
+
+    def test_the_watcher_re_reads_when_the_catalog_generation_moves(self):
+        listing, client = _lazy_listing({"": _level(sources=["a"])})
+        listing.refresh()
+        client.query.reset_mock()
+        client.catalog_children.reset_mock()
+        client.health_check.side_effect = [
+            {"source_count": 1, "catalog_generation": "1.0"},
+            {"source_count": 1, "catalog_generation": "1.0"},
+            {"source_count": 1, "catalog_generation": "1.1"},
+        ]
+        _watch(listing, 3)
+        # The first poll sets the baseline, the second is the same, the third moved.
+        assert client.catalog_children.call_count == 1
+
+    def test_drop_roots_are_read_for_the_remove_button(self):
+        listing, client = _lazy_listing({"": _level(folders=["lab"])})
+        base = client.query.side_effect
+
+        def query(sql, **kw):
+            if "dnd://" in sql:
+                return [{"root": "dnd://lab"}, {"root": None}]
+            return base(sql, **kw)
+
+        client.query.side_effect = query
+        listing.refresh()
+        assert listing.dropped_roots == {"dnd://lab"}
+
+    def test_clear_forgets_the_levels(self):
+        listing, _ = _lazy_listing({"": _level(sources=["a"])})
+        listing.refresh()
+        listing.clear()
+        assert not listing.lazy and not listing.levels and not listing.sources
+
+
+class TestLazyRaces:
+    def test_a_folder_read_during_a_re_list_survives_it(self):
+        levels = {"": _level(folders=["a"]), "a": _level(sources=["x"])}
+        listing, client = _lazy_listing(levels)
+        listing.refresh()
+        base = client.catalog_children.side_effect
+
+        def children(key, limit):
+            if key == "":
+                listing.load_level("a")  # the folder worker lands mid re-list
+            return base(key, limit)
+
+        client.catalog_children.side_effect = children
+        listing.refresh()
+        assert "a" in listing.levels
+
+    def test_a_read_begun_before_a_clear_is_dropped(self):
+        levels = {"": _level(folders=["a"]), "a": _level(sources=["x"])}
+        listing, client = _lazy_listing(levels)
+        listing.refresh()
+        base = client.catalog_children.side_effect
+
+        def children(key, limit):
+            listing.clear()
+            return base(key, limit)
+
+        client.catalog_children.side_effect = children
+        try:
+            listing.load_level("a")
+        except RuntimeError:
+            pass
+        assert not listing.levels and not listing.lazy

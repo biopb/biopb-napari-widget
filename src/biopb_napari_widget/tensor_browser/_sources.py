@@ -4,6 +4,11 @@ Qt-free, so it runs and tests without a display. It reads through the shared
 :class:`biopb.tensor.Connection` and holds the one cache in the picture: the
 list of sources the tree is drawn from.
 
+A server that answers ``catalog_children`` is read a folder at a time, so what
+is fetched, held and drawn follows what the user has opened, not the size of the
+catalog (``lazy``). An older server is listed whole, as before. In both,
+``sources`` is the descriptors the tree can show.
+
 Threading: the watcher re-lists from its own daemon thread and only ever
 *rebinds* ``sources`` to a fresh dict, so a reader on the Qt thread sees the
 whole old list or the whole new one.
@@ -28,12 +33,18 @@ SERVER_QUERY_THRESHOLD = 1000
 WATCH_MIN_INTERVAL_S = 30.0
 WATCH_MAX_INTERVAL_S = 300.0
 
+#: Most children one folder asks for; the server says when it holds more.
+LEVEL_LIMIT = 2000
+
+#: Source ids per descriptor query, so no statement grows without bound.
+_DESCRIBE_CHUNK = 500
+
 #: The columns ``_catalog`` decodes.
 _BASE_COLUMNS = "source_id, source_url, source_type, is_resolved, tensors"
 
 
-def _sources_sql(client) -> str:
-    """The listing query. An SDK with ``source_row_columns`` adds
+def source_columns(client) -> str:
+    """The columns to read a source with. An SDK with ``source_row_columns`` adds
     ``unresolved_reason`` when the server's schema has it; an older one gets the
     base columns, and a row without a reason reads as a cloud source."""
     columns = _BASE_COLUMNS
@@ -44,7 +55,30 @@ def _sources_sql(client) -> str:
     else:
         if isinstance(probed, str) and probed:
             columns = probed
-    return f"SELECT {columns} FROM sources ORDER BY source_id"
+    return columns
+
+
+def _sources_sql(client) -> str:
+    return f"SELECT {source_columns(client)} FROM sources ORDER BY source_id"
+
+
+def _quote(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _valid_level(level) -> bool:
+    return (
+        isinstance(level, dict)
+        and isinstance(level.get("folders"), list)
+        and isinstance(level.get("sources"), list)
+    )
+
+
+#: The roots of the drag-dropped branches: ``dnd://`` and the first path part.
+_DND_ROOTS_SQL = (
+    "SELECT DISTINCT regexp_extract(source_url, '^dnd://[^\\\\/]+') AS root "
+    "FROM sources WHERE source_url LIKE 'dnd://%'"
+)
 
 
 #: One row per (tensor, set): what annotations the server holds. Reserved
@@ -79,6 +113,19 @@ class SourceList:
     def __init__(self, connection) -> None:
         self._conn = connection
         self.sources: Dict[str, CatalogSource] = {}
+        #: Read a folder at a time (the server answers ``catalog_children``);
+        #: ``levels`` then holds the folders read, by key (``""`` is the top).
+        self.lazy = False
+        self.levels: Dict[str, dict] = {}
+        #: ``dnd://<name>`` of each drag-dropped branch, for the tree's [x].
+        self.dropped_roots: frozenset = frozenset()
+        self._lazy_unsupported = False
+        # The watcher and the folder workers both commit levels; a commit is
+        # whole, and one begun before a clear() is dropped.
+        self._lock = threading.Lock()
+        self._epoch = 0
+        #: Folder keys the user has open, asked of the widget on each re-list.
+        self.open_keys = lambda: ()
         #: Which annotation sets each tensor has, ``{array_id: {set: count}}``,
         #: or ``None`` when the server has no queryable ``rois`` table (an older
         #: server, or annotations switched off) -- the ROI feature is then off.
@@ -102,21 +149,125 @@ class SourceList:
 
     @property
     def use_server_query(self) -> bool:
-        return len(self.sources) > SERVER_QUERY_THRESHOLD
+        return self.lazy or len(self.sources) > SERVER_QUERY_THRESHOLD
 
     def clear(self) -> None:
+        with self._lock:
+            self._epoch += 1
         self.sources = {}
+        self.levels = {}
+        self.lazy = False
+        self._lazy_unsupported = False
+        self.dropped_roots = frozenset()
         self.roi_sets = None
         self._roi_unsupported = False  # a new connection may be a newer server
         self.last_health = None
 
     def refresh(self) -> Dict[str, CatalogSource]:
-        """Re-list the whole catalog from the server."""
+        """Re-read the catalog: the top and the open folders on a server that
+        serves them a level at a time, else the whole listing."""
         client = self._client()
+        if not self._lazy_unsupported and self._refresh_levels(client):
+            self._refresh_roi_sets(client)
+            return self.sources
         rows = client.query(_sources_sql(client), format="records")
+        self.lazy = False
+        self.levels = {}
         self.sources = {s.source_id: s for s in sources_from_rows(rows)}
         self._refresh_roi_sets(client)
         return self.sources
+
+    def _refresh_levels(self, client) -> bool:
+        """Re-read the levels; False when the server (or SDK) cannot serve them."""
+        epoch, before = self._epoch, self.levels
+        try:
+            top = client.catalog_children("", LEVEL_LIMIT)
+        except AttributeError:
+            top = None
+        except RuntimeError as exc:
+            if "catalog_children" not in str(exc):
+                raise
+            top = None
+        if not _valid_level(top):
+            self._lazy_unsupported = True
+            return False
+        levels = {"": top}
+        for key in sorted(k for k in self.open_keys() if k and k in self.levels):
+            try:
+                levels[key] = self._read_level(client, key)
+            except Exception:  # noqa: BLE001 - a folder that fails keeps its last read
+                logger.debug("Reading folder %r failed", key, exc_info=True)
+                levels[key] = self.levels[key]
+        self._commit(client, levels, epoch, before)
+        self._refresh_dropped_roots(client)
+        return True
+
+    @staticmethod
+    def _read_level(client, key: str) -> dict:
+        level = client.catalog_children(key, LEVEL_LIMIT)
+        if not _valid_level(level):
+            raise ValueError(f"unexpected catalog_children answer for {key!r}")
+        return level
+
+    def _commit(self, client, levels: Dict[str, dict], epoch: int, before=None) -> None:
+        """Take *levels* and the descriptors of the sources they list. Rebinds,
+        so a reader on another thread sees the old state or the new.
+
+        With *before* (the levels a re-list started from), *levels* replaces them
+        but for folders read since, which a concurrent read added. A commit begun
+        before a ``clear()`` is dropped.
+        """
+        ids = [s["source_id"] for lv in levels.values() for s in lv["sources"]]
+        described = self.describe(ids, client)
+        with self._lock:
+            if epoch != self._epoch or self._conn.client is not client:
+                raise RuntimeError("The connection changed")
+            if before is None:
+                levels = {**self.levels, **levels}
+            else:
+                levels = {
+                    **{k: v for k, v in self.levels.items() if k not in before},
+                    **levels,
+                }
+            self.sources = {**self.sources, **described}
+            self.levels = levels
+            self.lazy = True
+
+    def describe(self, ids, client=None) -> Dict[str, CatalogSource]:
+        """The descriptors of *ids*, read from the catalog."""
+        client = client or self._client()
+        ids = list(ids)
+        columns = source_columns(client)
+        out: Dict[str, CatalogSource] = {}
+        for i in range(0, len(ids), _DESCRIBE_CHUNK):
+            chunk = ", ".join(_quote(x) for x in ids[i : i + _DESCRIBE_CHUNK])
+            rows = client.query(
+                f"SELECT {columns} FROM sources WHERE source_id IN ({chunk})",
+                format="records",
+            )
+            out.update({s.source_id: s for s in sources_from_rows(rows)})
+        return out
+
+    def load_level(self, key: str) -> dict:
+        """Read one folder (off the GUI thread) and keep it with its sources."""
+        client, epoch = self._client(), self._epoch
+        level = self._read_level(client, key)
+        self._commit(client, {key: level}, epoch)
+        return level
+
+    def add_sources(self, found: Dict[str, CatalogSource]) -> None:
+        """Keep descriptors read for something other than a level (a search)."""
+        with self._lock:
+            self.sources = {**self.sources, **found}
+
+    def _refresh_dropped_roots(self, client) -> None:
+        try:
+            rows = client.query(_DND_ROOTS_SQL, format="records")
+            self.dropped_roots = frozenset(
+                r["root"] for r in rows if isinstance(r.get("root"), str) and r["root"]
+            )
+        except Exception:  # noqa: BLE001 - the tree just has no [x] on drops
+            logger.debug("Reading the dropped roots failed", exc_info=True)
 
     def _refresh_roi_sets(self, client) -> None:
         """Read which sets each tensor has, if the server will say.
@@ -254,6 +405,7 @@ class SourceList:
         interval = min_interval
         last_count: int | None = None
         last_pending = 0
+        last_generation = None
         while not self._watch_stop.wait(interval):
             if self._conn.client is None:
                 last_count = None
@@ -268,13 +420,22 @@ class SourceList:
             if count is None:
                 interval = max_interval
                 continue
+            generation = health.get("catalog_generation") if health else None
             if last_count is None:
-                last_count = len(self.sources)
+                # A lazy listing holds a few levels, not the catalog: what it was
+                # listed against is what the server said at the first poll.
+                last_count = count if self.lazy else len(self.sources)
+                last_generation = generation
             pending = self.registration_pending()
-            if count != last_count or pending != last_pending:
+            if (
+                count != last_count
+                or pending != last_pending
+                or generation != last_generation
+            ):
                 self._relist()
                 last_count = count
                 last_pending = pending
+                last_generation = generation
                 interval = min_interval
             elif pending:
                 interval = min_interval  # registering: keep the tree filling in
