@@ -542,7 +542,6 @@ class _SearchWorker(QThread):
                 format="records",
             )
             if self._keep is not None:
-                rows = rows[: SERVER_QUERY_LIMIT + 1]
                 self._keep({s.source_id: s for s in sources_from_rows(rows)})
         except Exception:
             logger.exception("Server search failed")
@@ -2273,9 +2272,10 @@ class TensorBrowserWidget(QWidget):
             tree.setUpdatesEnabled(True)
 
     def _on_item_collapsed(self, item: QTreeWidgetItem):
-        self._level_failed.discard(item.data(0, Qt.ItemDataRole.UserRole))
         if item.data(0, Qt.ItemDataRole.UserRole + 1) in ("folder", "source"):
-            self._expanded_folders.discard(item.data(0, Qt.ItemDataRole.UserRole))
+            key = item.data(0, Qt.ItemDataRole.UserRole)
+            self._level_failed.discard(key)
+            self._expanded_folders.discard(key)
 
     def _restore_expanded_state(self, under: QTreeWidgetItem | None = None):
         """Restore expanded state for folders (below *under*, else everywhere)."""

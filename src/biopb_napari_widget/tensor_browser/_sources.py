@@ -257,7 +257,8 @@ class SourceList:
 
     def add_sources(self, found: Dict[str, CatalogSource]) -> None:
         """Keep descriptors read for something other than a level (a search)."""
-        self.sources = {**self.sources, **found}
+        with self._lock:
+            self.sources = {**self.sources, **found}
 
     def _refresh_dropped_roots(self, client) -> None:
         try:
