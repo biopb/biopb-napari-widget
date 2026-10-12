@@ -182,6 +182,7 @@ def widget(qapp, monkeypatch):
     workers.clear()  # the source watcher's thread, captured at construction
     listing = MagicMock()
     listing.sources = {}
+    listing.lazy = False
     listing.use_server_query = False
     # Default: server is not mid-scan, so an empty catalog renders as a genuine
     # "no sources" error (progressive-discovery indexing case is opt-in per test).
@@ -1406,6 +1407,22 @@ class TestSearch:
         g, ids, more = got[0]
         assert len(ids) == SERVER_QUERY_LIMIT and more is True
 
+    def test_worker_hands_whole_matches_on_when_the_listing_is_by_folder(self, qapp):
+        from biopb_napari_widget.tensor_browser._widget import _SearchWorker
+
+        client = MagicMock()
+        client.query.return_value = [
+            {"source_id": "a", "source_url": "/d/a", "source_type": "zarr"}
+        ]
+        kept, got = [], []
+        worker = _SearchWorker(
+            client, "q", 1, columns="source_id, source_url", keep=kept.append
+        )
+        worker.done.connect(lambda g, ids, more: got.append(ids))
+        worker.run()
+        assert "SELECT source_id, source_url FROM" in client.query.call_args[0][0]
+        assert list(kept[0]) == ["a"] and got == [{"a"}]
+
     def test_worker_failure_is_reported(self, qapp):
         from biopb_napari_widget.tensor_browser._widget import _SearchWorker
 
@@ -1806,3 +1823,159 @@ def test_watcher_polls_every_half_minute_at_least():
 
     assert WATCH_MIN_INTERVAL_S >= 30
     assert WATCH_MAX_INTERVAL_S >= WATCH_MIN_INTERVAL_S
+
+
+class TestLazyTree:
+    """Read a folder at a time: the tree holds what is open, and opening a
+    folder reads it."""
+
+    @staticmethod
+    def _lazy(w, monkeypatch):
+        from biopb_napari_widget._catalog import CatalogSource, CatalogTensor
+        from biopb_napari_widget.tensor_browser import _widget as widget_mod
+
+        def src(sid, url):
+            return CatalogSource(
+                source_id=sid,
+                source_url=url,
+                source_type="zarr",
+                tensors=(CatalogTensor(array_id=sid, shape=(8, 8), dtype="uint8"),),
+            )
+
+        read = []
+
+        class _Worker:
+            def __init__(self, _sources, key):
+                read.append(key)
+                self.done = MagicMock()
+                self.failed = MagicMock()
+                self.finished = MagicMock()
+
+            def start(self):
+                pass
+
+        monkeypatch.setattr(widget_mod, "_LevelWorker", _Worker)
+        lst = w._list
+        lst.lazy = True
+        lst.dropped_roots = frozenset()
+        lst.sources = {
+            "t": src("t", "file:///d/t.zarr"),
+            "x": src("x", "file:///d/a/x.zarr"),
+        }
+        lst.levels = {
+            "": {
+                "key": "",
+                "folders": [
+                    {"name": "a", "key": "a"},
+                    {"name": "b/c", "key": "b/c"},
+                ],
+                "sources": [{"name": "t.zarr", "source_id": "t"}],
+                "truncated": False,
+            }
+        }
+        w._conn.client = MagicMock()
+        w._build_and_display_tree = lambda **kw: (
+            widget_mod.TensorBrowserWidget._build_and_display_tree(w, **kw)
+        )
+        return read, lst
+
+    @staticmethod
+    def _rows(w):
+        tree = w._tree_widget
+        return [
+            (tree.topLevelItem(i).text(0), tree.topLevelItem(i))
+            for i in range(tree.topLevelItemCount())
+        ]
+
+    def test_a_closed_folder_holds_a_placeholder_and_reads_nothing(
+        self, widget, monkeypatch
+    ):
+        w, _, _ = widget
+        read, _ = self._lazy(w, monkeypatch)
+        w._build_and_display_tree()
+        rows = dict(self._rows(w))
+        assert set(rows) == {"a", "b/c", "t.zarr"}
+        assert rows["a"].child(0).text(0) == "Loading…" and not read
+
+    def test_opening_a_folder_reads_it_and_the_tree_fills_when_it_lands(
+        self, widget, monkeypatch
+    ):
+        w, _, _ = widget
+        read, lst = self._lazy(w, monkeypatch)
+        w._build_and_display_tree()
+        dict(self._rows(w))["a"].setExpanded(True)
+        assert read == ["a"]
+        lst.levels = {
+            **lst.levels,
+            "a": {
+                "key": "a",
+                "folders": [],
+                "sources": [{"name": "x.zarr", "source_id": "x"}],
+                "truncated": True,
+            },
+        }
+        w._on_level_done("a")
+        a = dict(self._rows(w))["a"]
+        assert a.isExpanded()
+        assert [a.child(i).text(0) for i in range(a.childCount())][0] == "x.zarr"
+        assert "search to find the rest" in a.child(a.childCount() - 1).text(0)
+        assert read == ["a"]  # a folder already read is not read again
+
+    def test_a_failed_read_says_so(self, widget, monkeypatch):
+        w, _, _ = widget
+        self._lazy(w, monkeypatch)
+        w._build_and_display_tree()
+        dict(self._rows(w))["a"].setExpanded(True)
+        w._on_level_failed("a")
+        assert "Could not load" in dict(self._rows(w))["a"].child(0).text(0)
+
+    def test_a_lone_top_folder_opens_by_itself(self, widget, monkeypatch):
+        w, _, _ = widget
+        read, lst = self._lazy(w, monkeypatch)
+        lst.levels[""]["folders"] = [{"name": "only", "key": "only"}]
+        lst.levels[""]["sources"] = []
+        w._build_and_display_tree()
+        assert read == ["only"]
+
+    def test_the_top_of_an_empty_catalog_is_empty(self, widget, monkeypatch):
+        w, _, _ = widget
+        _, lst = self._lazy(w, monkeypatch)
+        assert not w._catalog_empty()
+        lst.levels[""].update(folders=[], sources=[])
+        assert w._catalog_empty()
+
+    def test_a_dropped_branch_is_tagged_for_removal(self, widget, monkeypatch):
+        w, _, _ = widget
+        _, lst = self._lazy(w, monkeypatch)
+        lst.dropped_roots = frozenset({"dnd://b"})
+        nodes = {n.name: n for n in w._level_nodes("", 1)}
+        assert nodes["b/c"].dropped and nodes["b/c"].remove_root == "dnd://b"
+        assert not nodes["a"].dropped
+
+
+def test_a_failed_folder_is_not_retried_by_the_rebuild(widget, monkeypatch):
+    w, _, _ = widget
+    read, _ = TestLazyTree._lazy(w, monkeypatch)
+    w._build_and_display_tree()
+    dict(TestLazyTree._rows(w))["a"].setExpanded(True)
+    w._on_level_failed("a")  # rebuilds, which re-expands "a"
+    assert read == ["a"]
+
+
+def test_a_landing_folder_leaves_the_other_open_folders_alone(widget, monkeypatch):
+    w, _, _ = widget
+    _, lst = TestLazyTree._lazy(w, monkeypatch)
+    lst.levels["a"] = {
+        "key": "a",
+        "folders": [],
+        "sources": [{"name": "x.zarr", "source_id": "x"}],
+        "truncated": False,
+    }
+    w._expanded_folders.add("a")
+    w._build_and_display_tree()
+    rows = dict(TestLazyTree._rows(w))
+    a_child = rows["a"].child(0)
+    lst.levels["b/c"] = {"key": "b/c", "folders": [], "sources": [], "truncated": False}
+    w._expanded_folders.add("b/c")
+    w._on_level_done("b/c")
+    assert dict(TestLazyTree._rows(w))["a"].child(0) is a_child  # not rebuilt
